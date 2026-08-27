@@ -167,7 +167,8 @@ end
     rng = Xoshiro(0xd1d)
     tol(ref) = 200 * eps(T) * max(norm(ref), one(T))
     shapes = [(64, 48), (256, 256), (33, 17), (16, 11), (11, 16), (8, 1), (1, 8),
-              (128, 3, 5), (16, 16, 16), (12, 10, 14)]
+              (128, 3, 5), (16, 16, 16), (12, 10, 14),
+              (32, 64), (60, 50), (24, 40, 3)]  # dim-1-batched paths
     @testset "dims = $dims" for dims in shapes
         x = randn(rng, Complex{T}, dims)
         ref = FFTW.fft(ComplexF64.(x))

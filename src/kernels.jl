@@ -39,6 +39,28 @@ end
     return o0, o1, o2, o3
 end
 
+# W×W register transpose: log2(W) rounds of lane interleaves. Round r pairs
+# vector i with i+W/2 and emits (lo, hi) in order, which after all rounds
+# yields the transposed tile.
+@generated function vtranspose(vs::NTuple{W,Vec{W,T}}) where {W,T}
+    syms = [Symbol(:v, 0, :_, i) for i in 1:W]
+    body = [:($(syms[i]) = vs[$i]) for i in 1:W]
+    rounds = trailing_zeros(W)
+    for r in 1:rounds
+        prev = syms
+        syms = [Symbol(:v, r, :_, i) for i in 1:W]
+        for i in 1:(W >> 1)
+            push!(body, :(($(syms[2i-1]), $(syms[2i])) =
+                interleave_chunks($(prev[i]), $(prev[i+(W>>1)]), Val(1))))
+        end
+    end
+    quote
+        $(Expr(:meta, :inline))
+        $(body...)
+        tuple($(syms...))
+    end
+end
+
 @generated function vreverse(v::Vec{W,T}) where {W,T}
     mask = ntuple(i -> W - i, W)
     quote

@@ -524,3 +524,79 @@ function stage4_ilvin!(yre::PlaneVec{T}, yim::PlaneVec{T}, px::Ptr{T},
     end
     return nothing
 end
+
+# Blocked out-of-place plane transpose: src is R×C (R fastest), dst becomes
+# C×R. W×W tiles go through the register transpose; QWin overlap covers
+# non-multiple extents (recomputed tiles store identical values). Scalar path
+# for extents below one tile.
+function transpose_plane!(dst::Vector{T}, src::Vector{T}, R::Int, C::Int) where {T}
+    W = pick_width(T)
+    if W > 1 && R ≥ W && C ≥ W
+        @inbounds for cb in QWin(C, W), rb in QWin(R, W)
+            tile = ntuple(j -> vload(Vec{W,T}, src, rb + R * (cb + j - 2)), Val(W))
+            tt = vtranspose(tile)
+            for i in 1:W
+                vstore(tt[i], dst, cb + C * (rb + i - 2))
+            end
+        end
+    else
+        @inbounds for c in 0:C-1, r in 0:R-1
+            dst[c+1+C*r] = src[r+1+R*c]
+        end
+    end
+    return nothing
+end
+
+# Batched rfft split/merge post-pass in transposed layout (pencil index
+# fastest): Z (B×h split planes, one length-h spectrum per lane) -> Y
+# (B×(h+1)). Requires B ≥ W. Twiddles e^{-2πik/n} broadcast per k.
+function rfft_post_batched!(yre::Vector{T}, yim::Vector{T},
+                            zre::Vector{T}, zim::Vector{T}, B::Int, h::Int,
+                            twr::Vector{T}, twi::Vector{T}) where {T}
+    W = pick_width(T)
+    hv = Vec{W,T}(T(0.5))
+    zv = Vec{W,T}(zero(T))
+    @inbounds for q in QWin(B, W)
+        z0r = vload(Vec{W,T}, zre, q)
+        z0i = vload(Vec{W,T}, zim, q)
+        vstore(z0r + z0i, yre, q);         vstore(zv, yim, q)
+        vstore(z0r - z0i, yre, B * h + q); vstore(zv, yim, B * h + q)
+        for k in 1:h-1
+            ar = vload(Vec{W,T}, zre, B * k + q)
+            ai = vload(Vec{W,T}, zim, B * k + q)
+            br = vload(Vec{W,T}, zre, B * (h - k) + q)
+            bi = -vload(Vec{W,T}, zim, B * (h - k) + q)
+            xer = (ar + br) * hv; xei = (ai + bi) * hv
+            xor_ = (ar - br) * hv; xoi = (ai - bi) * hv
+            wr = Vec{W,T}(twr[k+1]); wi = Vec{W,T}(twi[k+1])
+            vstore(xer + muladd(wr, xoi, wi * xor_), yre, B * k + q)
+            vstore(xei + muladd(wi, xoi, -(wr * xor_)), yim, B * k + q)
+        end
+    end
+    return nothing
+end
+
+# Batched irfft/brfft pre-pass, transposed layout: X (B×(h+1)) -> Z (B×h).
+# pre carries the pair factor and any folded normalization; twiddles e^{+2πik/n}.
+function irfft_pre_batched!(zre::Vector{T}, zim::Vector{T},
+                            xre::Vector{T}, xim::Vector{T}, B::Int, h::Int,
+                            twr::Vector{T}, twi::Vector{T}, pre::T) where {T}
+    W = pick_width(T)
+    pv = Vec{W,T}(pre)
+    @inbounds for q in QWin(B, W)
+        for k in 0:h-1
+            ar = vload(Vec{W,T}, xre, B * k + q)
+            ai = vload(Vec{W,T}, xim, B * k + q)
+            br = vload(Vec{W,T}, xre, B * (h - k) + q)
+            bi = -vload(Vec{W,T}, xim, B * (h - k) + q)
+            xer = (ar + br) * pv; xei = (ai + bi) * pv
+            xdr = (ar - br) * pv; xdi = (ai - bi) * pv
+            wr = Vec{W,T}(twr[k+1]); wi = Vec{W,T}(twi[k+1])
+            tr = muladd(wr, xdr, -(wi * xdi))
+            ti = muladd(wr, xdi, wi * xdr)
+            vstore(xer - ti, zre, B * k + q)
+            vstore(xei + tr, zim, B * k + q)
+        end
+    end
+    return nothing
+end
