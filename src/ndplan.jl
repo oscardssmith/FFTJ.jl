@@ -54,11 +54,11 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
         Bi = prod(dims[1:d-1])
         Bo = prod(dims[d+1:N])
         if factor_smooth(nd) !== nothing
-            stages, _ = build_stages(T, nd, D; allow_small=Bi == 1)
+            stages, _ = build_stages_cached(T, nd, D; allow_small=Bi == 1)
             # dim-1 chains that don't earn the fused-edge treatment run
             # transposed, with pencils as vector lanes, on a no-small chain
             bstages = if Bi == 1 && Bo ≥ W && !pencil_fused(T, nd, stages)
-                first(build_stages(T, nd, D; allow_small=false))
+                first(build_stages_cached(T, nd, D; allow_small=false))
             else
                 Stage{T}[]
             end
@@ -284,7 +284,7 @@ function _real_batched(::Type{T}, n1::Int, B::Int) where {T}
     (W > 1 && iseven(n1) && n1 ≥ 2 && B ≥ W) || return false
     h = n1 >>> 1
     factor_smooth(h) === nothing && return false
-    stages, _ = build_stages(T, h, -1)
+    stages, _ = build_stages_cached(T, h, -1)
     pencil_fused(T, h, stages) || return true
     # measured crossover: with fused pencils available, the transpose overhead
     # only pays at W = 16 (Float32) and while the working set is L2-resident
@@ -307,7 +307,7 @@ function _ndrfft(::Type{T}, dims::NTuple{N,Int}) where {T<:AbstractFloat,N}
     cdims = (n1 ÷ 2 + 1, dims[2:N]...)
     B = prod(dims[2:N])
     batched = _real_batched(T, n1, B)
-    bstages = batched ? first(build_stages(T, n1 >>> 1, -1; allow_small=false)) :
+    bstages = batched ? first(build_stages_cached(T, n1 >>> 1, -1; allow_small=false)) :
               Stage{T}[]
     return RfftNdPlan{T,N,typeof(plan_rfft(T, n1))}(
         dims, cdims, B, plan_rfft(T, n1),
@@ -384,7 +384,7 @@ function _ndirfft(::Type{T}, dims::NTuple{N,Int}; normalized::Bool) where {T<:Ab
     restscale = normalized ? one(T) / B : one(T)
     r1 = plan_irfft(T, n1; normalized)
     batched = _real_batched(T, n1, B)
-    bstages = batched ? first(build_stages(T, h, +1; allow_small=false)) : Stage{T}[]
+    bstages = batched ? first(build_stages_cached(T, h, +1; allow_small=false)) : Stage{T}[]
     # batched path skips both the rest chain's output scale and the 1-D inner
     # normalization, so fold everything into the pre-pass factor:
     # irfft total = 1/(n1·prod(dims[2:N])) = (1/2)·(1/h)·restscale

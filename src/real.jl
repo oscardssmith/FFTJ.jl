@@ -24,15 +24,22 @@ struct IrfftPlan{T,P}
     buf2::Vector{Complex{T}}  # odd case: complex output
 end
 
+const _RTW_CACHE = Dict{Tuple{DataType,Int,Int,Int},Any}()
 function real_twiddles(::Type{T}, n::Int, len::Int, D::Int) where {T}
-    twr = Vector{T}(undef, len)
-    twi = Vector{T}(undef, len)
-    for k in 0:len-1
-        θ = D * (Float64(2k) / n)
-        twr[k+1] = T(cospi(θ))
-        twi[k+1] = T(sinpi(θ))
+    r = lock(_PLAN_CACHE_LOCK) do
+        get!(_RTW_CACHE, (T, n, len, D)) do
+            twr = Vector{T}(undef, len)
+            twi = Vector{T}(undef, len)
+            for k in 0:len-1
+                θ = D * (Float64(2k) / n)
+                si, co = sincospi(θ)
+                twr[k+1] = T(co)
+                twi[k+1] = T(si)
+            end
+            (twr, twi)
+        end
     end
-    return twr, twi
+    return r::Tuple{Vector{T},Vector{T}}
 end
 
 function plan_rfft(::Type{T}, n::Integer) where {T<:AbstractFloat}

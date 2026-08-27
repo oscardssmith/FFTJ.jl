@@ -24,7 +24,8 @@ function chirp(::Type{T}, n::Int, D::Int) where {T}
     for j in 0:n-1
         t = widemul(j, j) % (2n)   # exp(iπ·t/n) has period t mod 2n
         θ = D * (Float64(t) / n)
-        c[j+1] = Complex{T}(cospi(θ), sinpi(θ))
+        si, co = sincospi(θ)
+        c[j+1] = Complex{T}(co, si)
     end
     return c
 end
@@ -40,20 +41,31 @@ struct BluesteinPlan{T,D}
     scale::T
 end
 
+# chirp + transformed kernel are plan-independent; share them by (T, n, D)
+const _BLUESTEIN_CACHE = Dict{Tuple{DataType,Int,Int},Any}()
+function _bluestein_parts(::Type{T}, n::Int, D::Int) where {T}
+    r = lock(_PLAN_CACHE_LOCK) do
+        get!(_BLUESTEIN_CACHE, (T, n, D)) do
+            N = nextsmooth(2n - 1)
+            c = chirp(T, n, D)
+            g = zeros(Complex{T}, N)
+            for j in 0:n-1
+                g[j+1] = conj(c[j+1])
+            end
+            for j in 1:n-1
+                g[N-j+1] = conj(c[j+1])
+            end
+            (N, c, _plan(T, N, -1)(g))
+        end
+    end
+    return r::Tuple{Int,Vector{Complex{T}},Vector{Complex{T}}}
+end
+
 function _bluestein(::Type{T}, n::Int, D::Int,
                     scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
-    N = nextsmooth(2n - 1)
-    c = chirp(T, n, D)
-    g = zeros(Complex{T}, N)
-    for j in 0:n-1
-        g[j+1] = conj(c[j+1])
-    end
-    for j in 1:n-1
-        g[N-j+1] = conj(c[j+1])
-    end
+    N, c, ghat = _bluestein_parts(T, n, D)
     pf = _plan(T, N, -1)
     pinv = _plan(T, N, +1)
-    ghat = pf(g)
     return BluesteinPlan{T,D}(n, c, ghat, pf, pinv,
                               Vector{Complex{T}}(undef, N),
                               Vector{Complex{T}}(undef, N), scale)

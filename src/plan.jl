@@ -45,16 +45,18 @@ function make_stage(::Type{T}, radix::Int, n::Int, s::Int, D::Int;
         for j in 1:radix-1, f in 1:ms
             p = (f - 1) ÷ s
             θ = Tw(2 * D * p * j) / n   # angle in units of π: w = exp(iπθ)
-            twr[(j-1)*ms+f] = T(cospi(θ))
-            twi[(j-1)*ms+f] = T(sinpi(θ))
+            si, co = sincospi(θ)
+            twr[(j-1)*ms+f] = T(co)
+            twi[(j-1)*ms+f] = T(si)
         end
     else
         twr = Vector{T}(undef, (radix - 1) * m)
         twi = Vector{T}(undef, (radix - 1) * m)
         for p in 0:m-1, j in 1:radix-1
             θ = Tw(2 * D * p * j) / n
-            twr[(radix-1)*p+j] = T(cospi(θ))
-            twi[(radix-1)*p+j] = T(sinpi(θ))
+            si, co = sincospi(θ)
+            twr[(radix-1)*p+j] = T(co)
+            twi[(radix-1)*p+j] = T(si)
         end
     end
     return Stage{T}(radix, small, twr, twi)
@@ -92,10 +94,26 @@ function build_stages(::Type{T}, n::Int, D::Int; allow_small::Bool=true) where {
     return stages, f
 end
 
+# Immutable plan parts (stage chains with their twiddle tables, Bluestein
+# chirps, real-edge twiddles) are shared across plans, FFTW-style; entries
+# live for the session and the GC handles the rest. Only per-plan scratch
+# buffers are allocated fresh, so repeated planning at one size is cheap —
+# DSP-style code plans per call.
+const _PLAN_CACHE_LOCK = ReentrantLock()
+const _STAGE_CACHE = Dict{Tuple{DataType,Int,Int,Bool},Any}()
+function build_stages_cached(::Type{T}, n::Int, D::Int;
+                             allow_small::Bool=true) where {T}
+    r = lock(_PLAN_CACHE_LOCK) do
+        get!(() -> build_stages(T, n, D; allow_small), _STAGE_CACHE,
+             (T, n, D, allow_small))
+    end
+    return r::Tuple{Vector{Stage{T}},Int}
+end
+
 function _plan(::Type{T}, n::Int, D::Int,
                scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
-    stages, f = build_stages(T, n, D)
+    stages, f = build_stages_cached(T, n, D)
     W = pick_width(T)
     slast = f > 1 ? n ÷ f : 0
     fused = W > 1 && length(stages) ≥ 2 &&
@@ -106,11 +124,22 @@ function _plan(::Type{T}, n::Int, D::Int,
                         Vector{T}(undef, n), Vector{T}(undef, n), scale)
 end
 
+# A smooth length whose odd stages would run at scalar strides (small 2-part)
+# is faster as an exact Bluestein over a padded pow2-rich length than as a
+# direct chain, once n is large enough to amortize the two transforms.
+function _slow_smooth(::Type{T}, n::Int, fac) where {T}
+    a, b, c, d = fac
+    return b + c + d > 0 && n ≥ 256 && (1 << a) < 4 * pick_width(T)
+end
+
 function _anyplan(::Type{T}, n::Int, D::Int,
                   scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
-    return factor_smooth(n) === nothing ? _bluestein(T, n, D, scale) :
-                                          _plan(T, n, D, scale)
+    fac = factor_smooth(n)
+    if fac === nothing || _slow_smooth(T, n, fac)
+        return _bluestein(T, n, D, scale)
+    end
+    return _plan(T, n, D, scale)
 end
 plan_fft(::Type{T}, n::Integer) where {T<:AbstractFloat} = _anyplan(T, Int(n), -1)
 plan_ifft(::Type{T}, n::Integer) where {T<:AbstractFloat} = _anyplan(T, Int(n), +1)
