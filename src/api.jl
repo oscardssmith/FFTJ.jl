@@ -185,3 +185,16 @@ irfft(X::Array{Complex{T},N}, n1::Integer) where {T<:AbstractFloat,N} =
     plan_irfft(X, n1) * X
 brfft(X::Array{Complex{T},N}, n1::Integer) where {T<:AbstractFloat,N} =
     plan_brfft(X, n1) * X
+
+# promoting/collecting one-shot fallbacks: integer element types, views,
+# ranges, and other AbstractArrays convert to dense float Arrays first
+_cfloat(x::AbstractArray{Complex{T},N}) where {T<:Real,N} =
+    Array{Complex{float(T)},N}(x)
+_rfloat(x::AbstractArray{T,N}) where {T<:Real,N} = Array{float(T),N}(x)
+fft(x::AbstractArray{<:Complex}) = fft(_cfloat(x))
+fft(x::AbstractArray{<:Real}) = fft(_rfloat(x))
+ifft(x::AbstractArray{<:Complex}) = ifft(_cfloat(x))
+bfft(x::AbstractArray{<:Complex}) = bfft(_cfloat(x))
+rfft(x::AbstractArray{<:Real}) = rfft(_rfloat(x))
+irfft(X::AbstractArray{<:Complex}, n1::Integer) = irfft(_cfloat(X), n1)
+brfft(X::AbstractArray{<:Complex}, n1::Integer) = brfft(_cfloat(X), n1)
