@@ -1,0 +1,86 @@
+# Bluestein's algorithm: an exact length-n DFT for any n via a circular
+# convolution of length N = nextsmooth(2n-1).  With the chirp
+# c[j] = exp(D·iπ j²/n):  X[k] = c[k] · Σ_j (x[j]c[j]) · conj(c[k-j]),
+# so X = c .* ifft_N(fft_N(x .* c, padded) .* ĝ) where ĝ is the precomputed
+# transform of the wrapped kernel conj(c).  The angle is reduced as j² mod 2n
+# in exact integers before cospi/sinpi, so the chirp is accurate for any n.
+
+# Smallest efficient transform length ≥ N: small odd part on a large power of
+# two, matching where the engine measures fastest (odd stages need wide
+# strides; a 2-part below ~2^6 falls off a cliff).
+const BLUESTEIN_ODD = (1, 3, 5, 7, 9, 15, 21)
+function nextsmooth(N::Int)
+    best = typemax(Int)
+    for o in BLUESTEIN_ODD
+        k = max(6, Base.top_set_bit(cld(N, o) - 1))
+        c = o << k
+        c < best && (best = c)
+    end
+    return best
+end
+
+function chirp(::Type{T}, n::Int, D::Int) where {T}
+    c = Vector{Complex{T}}(undef, n)
+    for j in 0:n-1
+        t = widemul(j, j) % (2n)   # exp(iπ·t/n) has period t mod 2n
+        θ = D * (Float64(t) / n)
+        c[j+1] = Complex{T}(cospi(θ), sinpi(θ))
+    end
+    return c
+end
+
+struct BluesteinPlan{T,D}
+    n::Int
+    c::Vector{Complex{T}}     # chirp
+    ghat::Vector{Complex{T}}  # fft_N of the wrapped kernel conj(c)
+    pf::FFTPlan{T,-1}
+    pinv::FFTPlan{T,1}
+    a::Vector{Complex{T}}     # length-N work buffers
+    b::Vector{Complex{T}}
+    scale::T
+end
+
+function _bluestein(::Type{T}, n::Int, D::Int) where {T<:AbstractFloat}
+    N = nextsmooth(2n - 1)
+    c = chirp(T, n, D)
+    g = zeros(Complex{T}, N)
+    for j in 0:n-1
+        g[j+1] = conj(c[j+1])
+    end
+    for j in 1:n-1
+        g[N-j+1] = conj(c[j+1])
+    end
+    pf = _plan(T, N, -1)
+    pinv = _plan(T, N, +1)
+    ghat = pf(g)
+    scale = D == -1 ? one(T) : one(T) / n
+    return BluesteinPlan{T,D}(n, c, ghat, pf, pinv,
+                              Vector{Complex{T}}(undef, N),
+                              Vector{Complex{T}}(undef, N), scale)
+end
+
+function (p::BluesteinPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
+    n = p.n
+    length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
+    length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
+    a, b, c, ghat = p.a, p.b, p.c, p.ghat
+    N = length(a)
+    @inbounds for j in 1:n
+        a[j] = x[j] * c[j]
+    end
+    @inbounds for j in n+1:N
+        a[j] = zero(Complex{T})
+    end
+    p.pf(b, a)
+    @inbounds @simd for j in 1:N
+        b[j] *= ghat[j]
+    end
+    p.pinv(a, b)
+    sc = p.scale
+    @inbounds for k in 1:n
+        y[k] = sc * (c[k] * a[k])
+    end
+    return y
+end
+
+(p::BluesteinPlan{T})(x::Vector{Complex{T}}) where {T} = p(similar(x), x)
