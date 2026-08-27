@@ -7,41 +7,13 @@
 
 const AnyPlan{T} = Union{FFTPlan{T},BluesteinPlan{T}}
 
-# region: FFTJ is 1-D only for now; accept and validate FFTW-style region args
-_checkregion(region) =
-    region in (1, (1,), 1:1) ||
-    throw(ArgumentError("FFTJ supports 1-D transforms along dimension 1 only (got region=$region)"))
-
-# planner flags (MEASURE/ESTIMATE etc.) are meaningless here; accept and ignore
-plan_fft(x::AbstractVector{Complex{T}}, region=1; kws...) where {T<:AbstractFloat} =
-    (_checkregion(region); plan_fft(T, length(x)))
-plan_ifft(x::AbstractVector{Complex{T}}, region=1; kws...) where {T<:AbstractFloat} =
-    (_checkregion(region); plan_ifft(T, length(x)))
-plan_bfft(x::AbstractVector{Complex{T}}, region=1; kws...) where {T<:AbstractFloat} =
-    (_checkregion(region); plan_bfft(T, length(x)))
-plan_rfft(x::AbstractVector{T}, region=1; kws...) where {T<:AbstractFloat} =
-    (_checkregion(region); plan_rfft(T, length(x)))
-function plan_brfft(X::AbstractVector{Complex{T}}, n::Integer, region=1;
-                    kws...) where {T<:AbstractFloat}
-    _checkregion(region)
-    length(X) == n ÷ 2 + 1 ||
-        throw(DimensionMismatch("brfft of length $n needs $(n ÷ 2 + 1) inputs, got $(length(X))"))
-    return plan_brfft(T, n)
-end
-plan_irfft(X::AbstractVector{Complex{T}}, n::Integer, region=1; kws...) where {T<:AbstractFloat} =
-    (_checkregion(region); plan_irfft(T, n))
-
 # In-place complex plans. Execution is alias-safe (the input is fully consumed
 # into scratch before the output is written), so these wrap ordinary plans.
+# Array-based constructors (with FFTW-style region and ignored planner flags)
+# live in the N-d section below and cover N == 1.
 struct InplacePlan{P}
     p::P
 end
-plan_fft!(x::AbstractVector{Complex{T}}, region=1; kws...) where {T<:AbstractFloat} =
-    (_checkregion(region); InplacePlan(plan_fft(T, length(x))))
-plan_ifft!(x::AbstractVector{Complex{T}}, region=1; kws...) where {T<:AbstractFloat} =
-    (_checkregion(region); InplacePlan(plan_ifft(T, length(x))))
-plan_bfft!(x::AbstractVector{Complex{T}}, region=1; kws...) where {T<:AbstractFloat} =
-    (_checkregion(region); InplacePlan(plan_bfft(T, length(x))))
 
 plan_fft!(::Type{T}, n::Integer) where {T<:AbstractFloat} = InplacePlan(plan_fft(T, n))
 plan_ifft!(::Type{T}, n::Integer) where {T<:AbstractFloat} = InplacePlan(plan_ifft(T, n))
@@ -63,11 +35,11 @@ Base.:*(p::RfftPlan{T}, x::Vector{T}) where {T} = p(x)
 LinearAlgebra.mul!(y::Vector{T}, p::IrfftPlan{T}, X::Vector{Complex{T}}) where {T} =
     p(y, X)
 Base.:*(p::IrfftPlan{T}, X::Vector{Complex{T}}) where {T} = p(X)
-function LinearAlgebra.mul!(y::CVec{T}, ip::InplacePlan, x::CVec{T}) where {T}
+function LinearAlgebra.mul!(y::AbstractArray, ip::InplacePlan, x::AbstractArray)
     ip.p(y, x)
     return y
 end
-function Base.:*(ip::InplacePlan, x::CVec{T}) where {T}
+function Base.:*(ip::InplacePlan, x::AbstractArray)
     ip.p(x, x)
     return x
 end
@@ -109,28 +81,107 @@ function Base.inv(s::Scaled)
     return q isa Scaled ? Scaled(q.p, q.scale / s.scale) : Scaled(q, inv(s.scale))
 end
 
-# one-shot transforms
-fft(x::AbstractVector{Complex{T}}) where {T<:AbstractFloat} =
-    plan_fft(T, length(x))(Vector(x))
-fft(x::AbstractVector{T}) where {T<:AbstractFloat} = fft(Complex{T}.(x))
-ifft(x::AbstractVector{Complex{T}}) where {T<:AbstractFloat} =
-    plan_ifft(T, length(x))(Vector(x))
-bfft(x::AbstractVector{Complex{T}}) where {T<:AbstractFloat} =
-    plan_bfft(T, length(x))(Vector(x))
-rfft(x::AbstractVector{T}) where {T<:AbstractFloat} = plan_rfft(T, length(x))(Vector(x))
-irfft(X::AbstractVector{Complex{T}}, n::Integer) where {T<:AbstractFloat} =
-    plan_irfft(T, n)(Vector(X))
-brfft(X::AbstractVector{Complex{T}}, n::Integer) where {T<:AbstractFloat} =
-    plan_brfft(T, n)(Vector(X))
-function fft!(x::Vector{Complex{T}}) where {T<:AbstractFloat}
-    plan_fft(T, length(x))(x, x)
+# in-place one-shot transforms (out-of-place one-shots are in the N-d section)
+function fft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N}
+    p = plan_fft!(x)
+    p * x
     return x
 end
-function ifft!(x::Vector{Complex{T}}) where {T<:AbstractFloat}
-    plan_ifft(T, length(x))(x, x)
+function ifft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N}
+    p = plan_ifft!(x)
+    p * x
     return x
 end
-function bfft!(x::Vector{Complex{T}}) where {T<:AbstractFloat}
-    plan_bfft(T, length(x))(x, x)
+function bfft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N}
+    p = plan_bfft!(x)
+    p * x
     return x
 end
+
+# --- N-d array methods -------------------------------------------------------
+
+_checkregion_nd(region, N) =
+    region == 1:N || region == ntuple(identity, N) || (N == 1 && region == 1) ||
+    throw(ArgumentError("FFTJ N-d plans transform all dims (expected region 1:$N, got $region)"))
+
+function plan_fft(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    return N == 1 ? plan_fft(T, length(x)) : _ndplan(T, size(x), -1, one(T))
+end
+function plan_bfft(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    return N == 1 ? plan_bfft(T, length(x)) : _ndplan(T, size(x), +1, one(T))
+end
+function plan_ifft(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    return N == 1 ? plan_ifft(T, length(x)) :
+           _ndplan(T, size(x), +1, one(T) / length(x))
+end
+function plan_fft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    return InplacePlan(N == 1 ? plan_fft(T, length(x)) : _ndplan(T, size(x), -1, one(T)))
+end
+function plan_bfft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    return InplacePlan(N == 1 ? plan_bfft(T, length(x)) : _ndplan(T, size(x), +1, one(T)))
+end
+function plan_ifft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    return InplacePlan(N == 1 ? plan_ifft(T, length(x)) :
+                       _ndplan(T, size(x), +1, one(T) / length(x)))
+end
+function plan_rfft(x::Array{T,N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    return N == 1 ? plan_rfft(T, length(x)) : _ndrfft(T, size(x))
+end
+function plan_brfft(X::Array{Complex{T},N}, n1::Integer, region=1:N;
+                    kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    size(X, 1) == n1 ÷ 2 + 1 ||
+        throw(DimensionMismatch("brfft of leading length $n1 needs $(n1 ÷ 2 + 1) rows, got $(size(X, 1))"))
+    return N == 1 ? plan_brfft(T, n1) :
+           _ndirfft(T, (Int(n1), size(X)[2:N]...); normalized=false)
+end
+function plan_irfft(X::Array{Complex{T},N}, n1::Integer, region=1:N;
+                    kws...) where {T<:AbstractFloat,N}
+    _checkregion_nd(region, N)
+    size(X, 1) == n1 ÷ 2 + 1 ||
+        throw(DimensionMismatch("irfft of leading length $n1 needs $(n1 ÷ 2 + 1) rows, got $(size(X, 1))"))
+    return N == 1 ? plan_irfft(T, n1) :
+           _ndirfft(T, (Int(n1), size(X)[2:N]...); normalized=true)
+end
+
+LinearAlgebra.mul!(y::Array{Complex{T},N}, p::NdPlan{T,D,N},
+                   x::Array{Complex{T},N}) where {T,D,N} = p(y, x)
+Base.:*(p::NdPlan{T,D,N}, x::Array{Complex{T},N}) where {T,D,N} = p(x)
+LinearAlgebra.mul!(Y::Array{Complex{T},N}, p::RfftNdPlan{T,N},
+                   X::Array{T,N}) where {T,N} = p(Y, X)
+Base.:*(p::RfftNdPlan{T,N}, X::Array{T,N}) where {T,N} = p(X)
+LinearAlgebra.mul!(y::Array{T,N}, p::IrfftNdPlan{T,N},
+                   X::Array{Complex{T},N}) where {T,N} = p(y, X)
+Base.:*(p::IrfftNdPlan{T,N}, X::Array{Complex{T},N}) where {T,N} = p(X)
+
+Base.size(p::NdPlan) = p.dims
+Base.size(p::RfftNdPlan) = p.rdims
+Base.size(p::IrfftNdPlan) = p.cdims
+
+function Base.inv(p::NdPlan{T,D,N}) where {T,D,N}
+    if D == -1
+        return Scaled(_ndplan(T, p.dims, +1, one(T)), one(T) / p.len)
+    elseif p.scale == 1
+        return Scaled(_ndplan(T, p.dims, -1, one(T)), one(T) / p.len)
+    else
+        return _ndplan(T, p.dims, -1, one(T))
+    end
+end
+
+# one-shot N-d transforms
+fft(x::Array{Complex{T},N}) where {T<:AbstractFloat,N} = plan_fft(x) * x
+ifft(x::Array{Complex{T},N}) where {T<:AbstractFloat,N} = plan_ifft(x) * x
+bfft(x::Array{Complex{T},N}) where {T<:AbstractFloat,N} = plan_bfft(x) * x
+fft(x::Array{T,N}) where {T<:AbstractFloat,N} = fft(Complex{T}.(x))
+rfft(x::Array{T,N}) where {T<:AbstractFloat,N} = plan_rfft(x) * x
+irfft(X::Array{Complex{T},N}, n1::Integer) where {T<:AbstractFloat,N} =
+    plan_irfft(X, n1) * X
+brfft(X::Array{Complex{T},N}, n1::Integer) where {T<:AbstractFloat,N} =
+    plan_brfft(X, n1) * X

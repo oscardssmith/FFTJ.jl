@@ -33,10 +33,11 @@ struct FFTPlan{T,D}
     scale::T
 end
 
-function make_stage(::Type{T}, radix::Int, n::Int, s::Int, D::Int) where {T}
+function make_stage(::Type{T}, radix::Int, n::Int, s::Int, D::Int;
+                    allow_small::Bool=true) where {T}
     m = n ÷ radix
     Tw = promote_type(T, Float64)
-    small = use_small(T, radix, m, s)
+    small = allow_small && use_small(T, radix, m, s)
     if small
         ms = m * s
         twr = Vector{T}(undef, (radix - 1) * ms)
@@ -61,33 +62,40 @@ end
 
 default_scale(::Type{T}, n, D) where {T} = D == -1 ? one(T) : one(T) / n
 
-function _plan(::Type{T}, n::Int, D::Int,
-               scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
-    n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
+# The 1-D stage chain for a 7-smooth n: final power-of-two stage f (m == 1,
+# twiddle-free, fusable); the rest of the 2-part runs as a radix-4 tower
+# first, so the odd-radix stages in between see large W-divisible strides.
+# allow_small=false suppresses the small-stride twiddle layout (batched N-d
+# passes run every stage at effective stride s·Bi ≥ W, never the small path).
+function build_stages(::Type{T}, n::Int, D::Int; allow_small::Bool=true) where {T}
     fac = factor_smooth(n)
-    fac === nothing && throw(ArgumentError("_plan requires a 7-smooth length (got $n)"))
+    fac === nothing && throw(ArgumentError("build_stages requires a 7-smooth length (got $n)"))
     a, b3, c5, d7 = fac
-    # final power-of-two stage f (m == 1, twiddle-free, fusable); the rest of
-    # the 2-part runs as a radix-4 tower first, so the odd-radix stages in
-    # between see large W-divisible strides.
     f = a == 0 ? 1 : isodd(a) ? (a ≥ 3 ? 8 : 2) : 4
     k4 = (a - trailing_zeros(f)) ÷ 2
     stages = Stage{T}[]
     ncur = n
     s = 1
     for _ in 1:k4
-        push!(stages, make_stage(T, 4, ncur, s, D))
+        push!(stages, make_stage(T, 4, ncur, s, D; allow_small))
         s *= 4
         ncur >>>= 2
     end
     for (radix, cnt) in ((7, d7), (5, c5), (3, b3))
         for _ in 1:cnt
-            push!(stages, make_stage(T, radix, ncur, s, D))
+            push!(stages, make_stage(T, radix, ncur, s, D; allow_small))
             s *= radix
             ncur ÷= radix
         end
     end
-    f > 1 && push!(stages, make_stage(T, f, ncur, s, D))
+    f > 1 && push!(stages, make_stage(T, f, ncur, s, D; allow_small))
+    return stages, f
+end
+
+function _plan(::Type{T}, n::Int, D::Int,
+               scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
+    n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
+    stages, f = build_stages(T, n, D)
     W = pick_width(T)
     slast = f > 1 ? n ÷ f : 0
     fused = W > 1 && length(stages) ≥ 2 &&
@@ -137,13 +145,14 @@ plan_bfft(::Type{T}, n::Integer) where {T<:AbstractFloat} =
     return nothing
 end
 
-# dense complex vectors accepted by plan execution: plain, or a reinterpret of
-# a real Vector (used by rfft/irfft to avoid copies)
-const CVec{T} = Union{Vector{Complex{T}},
-                      Base.ReinterpretArray{Complex{T},1,T,Vector{T},false}}
-_rawptr(x::Vector{Complex{T}}) where {T} = convert(Ptr{T}, pointer(x))
-_rawptr(x::Base.ReinterpretArray{Complex{T},1,T,Vector{T},false}) where {T} =
-    pointer(parent(x))
+# complex vectors accepted by plan execution: anything contiguous with a
+# recoverable data pointer (Vector, contiguous views, reinterprets of either —
+# used by rfft/irfft and the N-d pencil loops to avoid copies)
+const CVec{T} = AbstractVector{Complex{T}}
+_rawptr(x::AbstractArray{Complex{T}}) where {T} = convert(Ptr{T}, pointer(x))
+_rawptr(x::Base.ReinterpretArray{Complex{T},1,T}) where {T} =
+    convert(Ptr{T}, pointer(parent(x)))
+_rawptr(x::AbstractVector{T}) where {T<:Real} = convert(Ptr{T}, pointer(x))
 
 function (p::FFTPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
     n = p.n

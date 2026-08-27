@@ -18,7 +18,7 @@ end
 Base.IteratorSize(::Type{QWin}) = Base.SizeUnknown()
 Base.eltype(::Type{QWin}) = Int
 
-function stage4!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
+function stage4!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
                  n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, d::Val{D}) where {T,D}
     m = n >>> 2
     ms = m * s
@@ -72,7 +72,7 @@ end
 # loading W consecutive flat elements from each quarter; the strided output
 # permutation becomes a static register interleave. Twiddles are pre-expanded
 # per lane: twr/twi hold w1, w2, w3 each over the m*s flat indices.
-function stage4_small!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
+function stage4_small!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
                        n::Int, ::Val{S}, twr::Vector{T}, twi::Vector{T},
                        d::Val{D}) where {T,S,D}
     W = pick_width(T)
@@ -103,7 +103,7 @@ end
 # First stage (radix 4, s == 1) reading directly from the interleaved complex
 # input: two vector loads + a deinterleave shuffle replace the copy pass.
 # Twiddles use the expanded small-stage layout.
-function stage4_first!(yre::Vector{T}, yim::Vector{T}, px::Ptr{T}, n::Int,
+function stage4_first!(yre::PlaneVec{T}, yim::PlaneVec{T}, px::Ptr{T}, n::Int,
                        twr::Vector{T}, twi::Vector{T}, d::Val{D}) where {T,D}
     W = pick_width(T)
     m = n >>> 2
@@ -137,12 +137,12 @@ end
 
 # Last stage (m == 1, so twiddle-free) writing scaled interleaved complex
 # output directly: butterfly, scale, re/im interleave shuffle, store.
-function stage4_last!(py::Ptr{T}, xre::Vector{T}, xim::Vector{T}, s::Int,
+function stage4_last!(py::Ptr{T}, xre::PlaneVec{T}, xim::PlaneVec{T}, s::Int,
                       scale::T, d::Val{D}) where {T,D}
     W = pick_width(T)
     sc = Vec{W,T}(scale)
     sz = sizeof(T)
-    @inbounds for q in 1:W:s
+    @inbounds for q in QWin(s, W)
         ar = vload(Vec{W,T}, xre, q);       ai = vload(Vec{W,T}, xim, q)
         br = vload(Vec{W,T}, xre, s + q);   bi = vload(Vec{W,T}, xim, s + q)
         cr = vload(Vec{W,T}, xre, 2s + q);  ci = vload(Vec{W,T}, xim, 2s + q)
@@ -163,13 +163,13 @@ end
 
 # Radix-8 final stage (m == 1, twiddle-free), fused interleaved output. Used
 # for odd log2 n so the extra radix-2 pass disappears.
-function stage8_last!(py::Ptr{T}, xre::Vector{T}, xim::Vector{T}, s::Int,
+function stage8_last!(py::Ptr{T}, xre::PlaneVec{T}, xim::PlaneVec{T}, s::Int,
                       scale::T, d::Val{D}) where {T,D}
     W = pick_width(T)
     sc = Vec{W,T}(scale)
     c = Vec{W,T}(T(sqrt(0.5)))
     sz = sizeof(T)
-    @inbounds for q in 1:W:s
+    @inbounds for q in QWin(s, W)
         x0r = vload(Vec{W,T}, xre, q);       x0i = vload(Vec{W,T}, xim, q)
         x1r = vload(Vec{W,T}, xre, s + q);   x1i = vload(Vec{W,T}, xim, s + q)
         x2r = vload(Vec{W,T}, xre, 2s + q);  x2i = vload(Vec{W,T}, xim, 2s + q)
@@ -191,7 +191,7 @@ end
 
 # Radix-8 final stage writing split planes (unfused fallback); butterfly
 # partners at stride s, outputs land at the same offsets.
-function stage8_plain!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
+function stage8_plain!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
                        s::Int, d::Val{D}) where {T,D}
     W = pick_width(T)
     if W > 1 && s ≥ W
@@ -227,12 +227,12 @@ function stage8_plain!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vect
 end
 
 # radix-2 variant of the fused last stage (odd log2 n)
-function stage2_last!(py::Ptr{T}, xre::Vector{T}, xim::Vector{T}, s::Int,
+function stage2_last!(py::Ptr{T}, xre::PlaneVec{T}, xim::PlaneVec{T}, s::Int,
                       scale::T) where {T}
     W = pick_width(T)
     sc = Vec{W,T}(scale)
     sz = sizeof(T)
-    @inbounds for q in 1:W:s
+    @inbounds for q in QWin(s, W)
         ar = vload(Vec{W,T}, xre, q);      ai = vload(Vec{W,T}, xim, q)
         br = vload(Vec{W,T}, xre, s + q);  bi = vload(Vec{W,T}, xim, s + q)
         lo, hi = interleave_chunks((ar + br) * sc, (ai + bi) * sc, Val(1))
@@ -245,7 +245,7 @@ end
 
 # Odd-radix stages. These run after the radix-4 tower, so s is large for all
 # but tiny n (scalar fallback otherwise).
-function stage3!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
+function stage3!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
                  n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D}) where {T,D}
     m = n ÷ 3
     ms = m * s
@@ -289,7 +289,7 @@ function stage3!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
     return nothing
 end
 
-function stage5!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
+function stage5!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
                  n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D}) where {T,D}
     m = n ÷ 5
     ms = m * s
@@ -345,7 +345,7 @@ bf7_consts(::Type{T}, D::Int) where {T} =
     (ntuple(i -> T(cospi(2 * (((i - 1) % 3 + 1) * ((i - 1) ÷ 3 + 1)) / 7)), 9),
      ntuple(i -> T(D * sinpi(2 * (((i - 1) % 3 + 1) * ((i - 1) ÷ 3 + 1)) / 7)), 9))
 
-function stage7!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
+function stage7!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
                  n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D}) where {T,D}
     m = n ÷ 7
     ms = m * s
@@ -396,7 +396,7 @@ function stage7!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
     return nothing
 end
 
-function stage2!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
+function stage2!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
                  n::Int, s::Int, twr::Vector{T}, twi::Vector{T}) where {T}
     m = n >>> 1
     ms = m * s
@@ -425,6 +425,101 @@ function stage2!(yre::Vector{T}, yim::Vector{T}, xre::Vector{T}, xim::Vector{T},
                 yre[yb+q] = y0r;    yim[yb+q] = y0i
                 yre[yb+s+q] = y1r;  yim[yb+s+q] = y1i
             end
+        end
+    end
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Whole-array split<->interleaved conversion passes (fallback edges for plans
+# whose first/last stage can't fuse the conversion).
+
+function deinterleave_all!(are::Vector{T}, aim::Vector{T},
+                           x::AbstractArray{Complex{T}}) where {T}
+    len = length(x)
+    W = pick_width(T)
+    if W > 1 && len ≥ W
+        GC.@preserve x begin
+            px = _rawptr(x)
+            sz = sizeof(T)
+            @inbounds for c in QWin(len, W)
+                u = vload(Vec{W,T}, px + sz * 2 * (c - 1))
+                v = vload(Vec{W,T}, px + sz * (2 * (c - 1) + W))
+                r, i = deinterleave2(u, v)
+                vstore(r, are, c)
+                vstore(i, aim, c)
+            end
+        end
+    else
+        @inbounds for c in 1:len
+            are[c] = real(x[c])
+            aim[c] = imag(x[c])
+        end
+    end
+    return nothing
+end
+
+function interleave_all!(y::AbstractArray{Complex{T}}, are::Vector{T}, aim::Vector{T},
+                         scale::T) where {T}
+    len = length(y)
+    W = pick_width(T)
+    if W > 1 && len ≥ W
+        GC.@preserve y begin
+            py = _rawptr(y)
+            sz = sizeof(T)
+            sc = Vec{W,T}(scale)
+            @inbounds for c in QWin(len, W)
+                r = vload(Vec{W,T}, are, c) * sc
+                i = vload(Vec{W,T}, aim, c) * sc
+                lo, hi = interleave_chunks(r, i, Val(1))
+                vstore(lo, py + sz * 2 * (c - 1))
+                vstore(hi, py + sz * (2 * (c - 1) + W))
+            end
+        end
+    else
+        @inbounds for c in 1:len
+            y[c] = Complex(scale * are[c], scale * aim[c])
+        end
+    end
+    return nothing
+end
+
+# Strided radix-4 stage reading interleaved complex input directly (the fused
+# input edge for chains whose first transformed dim is > 1). px points at the
+# block's first element; requires s ≥ W.
+function stage4_ilvin!(yre::PlaneVec{T}, yim::PlaneVec{T}, px::Ptr{T},
+                       n::Int, s::Int, twr::Vector{T}, twi::Vector{T},
+                       d::Val{D}) where {T,D}
+    m = n >>> 2
+    ms = m * s
+    W = pick_width(T)
+    sz = sizeof(T)
+    @inbounds for p in 0:m-1
+        w1r = Vec{W,T}(twr[3p+1]); w1i = Vec{W,T}(twi[3p+1])
+        w2r = Vec{W,T}(twr[3p+2]); w2i = Vec{W,T}(twi[3p+2])
+        w3r = Vec{W,T}(twr[3p+3]); w3i = Vec{W,T}(twi[3p+3])
+        xb = s * p
+        yb = 4 * s * p
+        for q in QWin(s, W)
+            c0 = xb + q - 1
+            u = vload(Vec{W,T}, px + sz * 2c0);            v = vload(Vec{W,T}, px + sz * (2c0 + W))
+            ar, ai = deinterleave2(u, v)
+            c0 += ms
+            u = vload(Vec{W,T}, px + sz * 2c0);            v = vload(Vec{W,T}, px + sz * (2c0 + W))
+            br, bi = deinterleave2(u, v)
+            c0 += ms
+            u = vload(Vec{W,T}, px + sz * 2c0);            v = vload(Vec{W,T}, px + sz * (2c0 + W))
+            cr, ci = deinterleave2(u, v)
+            c0 += ms
+            u = vload(Vec{W,T}, px + sz * 2c0);            v = vload(Vec{W,T}, px + sz * (2c0 + W))
+            dr, di = deinterleave2(u, v)
+            y0r, y0i, y1r, y1i, y2r, y2i, y3r, y3i =
+                bf4(ar, ai, br, bi, cr, ci, dr, di,
+                    w1r, w1i, w2r, w2i, w3r, w3i, d)
+            vstore(y0r, yre, yb + q);      vstore(y0i, yim, yb + q)
+            vstore(y1r, yre, yb + s + q);  vstore(y1i, yim, yb + s + q)
+            vstore(y2r, yre, yb + 2s + q); vstore(y2i, yim, yb + 2s + q)
+            vstore(y3r, yre, yb + 3s + q); vstore(y3i, yim, yb + 3s + q)
         end
     end
     return nothing

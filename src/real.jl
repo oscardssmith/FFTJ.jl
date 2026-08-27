@@ -79,7 +79,7 @@ plan_brfft(::Type{T}, n::Integer) where {T<:AbstractFloat} =
     plan_irfft(T, n; normalized=false)
 
 # y may be a contiguous view (e.g. the leading half of a longer spectrum buffer)
-function (p::RfftPlan{T})(y::AbstractVector{Complex{T}}, x::Vector{T}) where {T}
+function (p::RfftPlan{T})(y::AbstractVector{Complex{T}}, x::AbstractVector{T}) where {T}
     n = p.n
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n ÷ 2 + 1 ||
@@ -146,7 +146,7 @@ function (p::RfftPlan{T})(y::AbstractVector{Complex{T}}, x::Vector{T}) where {T}
     return y
 end
 
-function (p::IrfftPlan{T})(y::Vector{T}, X::Vector{Complex{T}}) where {T}
+function (p::IrfftPlan{T})(y::AbstractVector{T}, X::AbstractVector{Complex{T}}) where {T}
     n = p.n
     length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
     length(X) == n ÷ 2 + 1 ||

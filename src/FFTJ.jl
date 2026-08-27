@@ -18,6 +18,7 @@ include("stockham.jl")
 include("plan.jl")
 include("bluestein.jl")
 include("real.jl")
+include("ndplan.jl")
 include("api.jl")
 
 end # module

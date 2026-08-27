@@ -2,6 +2,10 @@
 # SIMD.Vec, so the same kernel serves the scalar and vectorized stage loops.
 # D is the sign of the exponent: -1 forward, +1 inverse.
 
+# contiguous plane storage: a Vector or a contiguous view of one (the offset
+# mechanism for batched N-d passes)
+const PlaneVec{T} = Union{Vector{T},SubArray{T,1,Vector{T},Tuple{UnitRange{Int}},true}}
+
 # native SIMD width used to vectorize stage loops (in elements of T)
 pick_width(::Type{Float64}) = 8
 pick_width(::Type{Float32}) = 16

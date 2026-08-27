@@ -163,6 +163,63 @@ end
     @test_throws ArgumentError plan_fft(x, 2)
 end
 
+@testset "N-d transforms vs FFTW ($T)" for T in (Float32, Float64)
+    rng = Xoshiro(0xd1d)
+    tol(ref) = 200 * eps(T) * max(norm(ref), one(T))
+    shapes = [(64, 48), (256, 256), (33, 17), (16, 11), (11, 16), (8, 1), (1, 8),
+              (128, 3, 5), (16, 16, 16), (12, 10, 14)]
+    @testset "dims = $dims" for dims in shapes
+        x = randn(rng, Complex{T}, dims)
+        ref = FFTW.fft(ComplexF64.(x))
+        p = plan_fft(x)
+        y = p * x
+        @test y ≈ ref atol = tol(ref)
+        z = similar(x)
+        @test mul!(z, p, x) === z
+        @test z ≈ ref atol = tol(ref)
+
+        # normalized inverse round trip and unnormalized backward
+        @test plan_ifft(x) * y ≈ x atol = tol(x)
+        @test plan_bfft(x) * y ≈ length(x) .* x atol = tol(length(x) .* x)
+
+        # in-place + inv(p!).p idiom (DSP complex conv)
+        p! = plan_fft!(x)
+        w = copy(x)
+        @test (p! * w) === w
+        @test w ≈ ref atol = tol(ref)
+        ip = inv(p!).p
+        ip * w
+        @test w ≈ length(x) .* x atol = tol(length(x) .* x)
+
+        # real transforms
+        xr = randn(rng, T, dims)
+        rref = FFTW.rfft(Float64.(xr))
+        pr = plan_rfft(xr)
+        Xr = pr * xr
+        @test size(Xr) == size(rref)
+        @test Xr ≈ rref atol = tol(rref)
+        n1 = dims[1]
+        pbr = plan_brfft(Xr, n1)
+        bref = FFTW.brfft(ComplexF64.(Xr), n1)
+        @test pbr * Xr ≈ bref atol = tol(bref)
+        @test plan_irfft(Xr, n1) * Xr ≈ xr atol = tol(xr)
+
+        # allocation-free planned execution
+        if prod(dims) > 32
+            mul!(z, p, x)
+            @test (@allocated mul!(z, p, x)) == 0
+        end
+    end
+    # one-shots
+    A = randn(rng, Complex{T}, (24, 15))
+    @test fft(A) ≈ FFTW.fft(ComplexF64.(A)) atol = tol(FFTW.fft(ComplexF64.(A)))
+    @test ifft(fft(A)) ≈ A atol = tol(A)
+    Ar = randn(rng, T, (20, 12))
+    @test rfft(Ar) ≈ FFTW.rfft(Float64.(Ar)) atol = tol(FFTW.rfft(Float64.(Ar)))
+    @test irfft(rfft(Ar), 20) ≈ Ar atol = tol(Ar)
+    @test fft!(copy(A)) ≈ FFTW.fft(ComplexF64.(A)) atol = tol(FFTW.fft(ComplexF64.(A)))
+end
+
 @testset "argument checking" begin
     @test_throws ArgumentError plan_fft(Float64, 0)
     p = plan_fft(Float64, 8)
