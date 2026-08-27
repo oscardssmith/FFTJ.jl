@@ -102,6 +102,14 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
                          fuse_in, fuse_out, dim1_batched, scale)
 end
 
+# transpose both planes from (cre,cim) into (ore,oim); returns the roles
+# swapped so the transposed data is the caller's new current plane
+function transpose_planes!(ore, oim, cre, cim, R::Int, C::Int)
+    transpose_plane!(ore, cre, R, C)
+    transpose_plane!(oim, cim, R, C)
+    return ore, oim, cre, cim
+end
+
 # per-pencil gather -> 1-D plan -> scatter, in place at the split-plane level
 function _fallback_pass!(cre::Vector{T}, cim::Vector{T}, pass::DimPass{T},
                          buf::Vector{Complex{T}}, buf2::Vector{Complex{T}}) where {T}
@@ -131,10 +139,7 @@ function _exec_nd!(p::NdPlan{T,D,N}, y::AbstractArray{Complex{T}},
     length(y) == len || throw(DimensionMismatch("plan length $len, output length $(length(y))"))
     np = length(p.passes)
     if np == 0
-        sc = p.scale
-        @inbounds for c in 1:len
-            y[c] = sc * x[c]
-        end
+        y .= p.scale .* x
         return y
     end
     GC.@preserve x y begin
@@ -159,23 +164,10 @@ function _nd_input!(p::NdPlan{T,D,N}, x, px::Ptr{T}) where {T,D,N}
             pass1 = p.passes[1]
             n1, B = pass1.nd, pass1.Bo
             deinterleave_all!(cre, cim, x)
-            transpose_plane!(ore, cre, n1, B)
-            transpose_plane!(oim, cim, n1, B)
-            cre, ore = ore, cre
-            cim, oim = oim, cim
-            ncur = n1
-            s = 1
-            for st in pass1.bstages
-                run_stage!(ore, oim, cre, cim, ncur, s * B, st, Val(D))
-                cre, ore = ore, cre
-                cim, oim = oim, cim
-                s *= st.radix
-                ncur ÷= st.radix
-            end
-            transpose_plane!(ore, cre, B, n1)
-            transpose_plane!(oim, cim, B, n1)
-            cre, ore = ore, cre
-            cim, oim = oim, cim
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, n1, B)
+            cre, cim, ore, oim =
+                run_chain!(cre, cim, ore, oim, pass1.bstages, n1, 1, B, Val(D))
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, B, n1)
         elseif p.fuse_in
             pass1 = p.passes[1]
             st1 = pass1.stages[1]
@@ -224,20 +216,12 @@ function _nd_core!(p::NdPlan{T,D,N}, y, py::Ptr{T}, cre, cim, ore, oim,
                 ncur0 ÷= pass.stages[k].radix
             end
             block = pass.Bi * pass.nd
+            chain = view(pass.stages, from:to)
             for o in 0:pass.Bo-1
                 rng = o*block+1:(o+1)*block
-                ar = view(cre, rng); ai = view(cim, rng)
-                br = view(ore, rng); bi = view(oim, rng)
-                ncur = ncur0
-                s = s0
-                for k in from:to
-                    st = pass.stages[k]
-                    run_stage!(br, bi, ar, ai, ncur, s * pass.Bi, st, Val(D))
-                    ar, br = br, ar
-                    ai, bi = bi, ai
-                    s *= st.radix
-                    ncur ÷= st.radix
-                end
+                run_chain!(view(cre, rng), view(cim, rng),
+                           view(ore, rng), view(oim, rng),
+                           chain, ncur0, s0, pass.Bi, Val(D))
             end
             if isodd(to - from + 1)
                 cre, ore = ore, cre
@@ -247,16 +231,9 @@ function _nd_core!(p::NdPlan{T,D,N}, y, py::Ptr{T}, cre, cim, ore, oim,
         if emit
             if p.fuse_out
                 pl = p.passes[end]
-                lst = pl.stages[end]
-                f = lst.radix
-                s_eff = pl.Bi * (pl.nd ÷ f)
-                if f == 4
-                    stage4_last!(py, cre, cim, s_eff, p.scale, Val(D))
-                elseif f == 8
-                    stage8_last!(py, cre, cim, s_eff, p.scale, Val(D))
-                else
-                    stage2_last!(py, cre, cim, s_eff, p.scale)
-                end
+                f = pl.stages[end].radix
+                run_last_stage!(py, cre, cim, pl.Bi * (pl.nd ÷ f), f, p.scale,
+                                Val(D))
             else
                 interleave_all!(y, cre, cim, p.scale)
             end
@@ -330,26 +307,11 @@ function (p::RfftNdPlan{T,N})(Y::Array{Complex{T},N}, X::Array{T,N}) where {T,N}
         cre, cim, ore, oim = r.are, r.aim, r.bre, r.bim
         GC.@preserve X Y begin
             deinterleave_all!(cre, cim, reinterpret(Complex{T}, X))
-            transpose_plane!(ore, cre, h, B)
-            transpose_plane!(oim, cim, h, B)
-            cre, ore = ore, cre
-            cim, oim = oim, cim
-            ncur = h
-            s = 1
-            for st in p.bstages
-                run_stage!(ore, oim, cre, cim, ncur, s * B, st, Val(-1))
-                cre, ore = ore, cre
-                cim, oim = oim, cim
-                s *= st.radix
-                ncur ÷= st.radix
-            end
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, h, B)
+            cre, cim, ore, oim =
+                run_chain!(cre, cim, ore, oim, p.bstages, h, 1, B, Val(-1))
             rfft_post_batched!(ore, oim, cre, cim, B, h, p.r1.twr, p.r1.twi)
-            cre, ore = ore, cre
-            cim, oim = oim, cim
-            transpose_plane!(ore, cre, B, h1p)
-            transpose_plane!(oim, cim, B, h1p)
-            cre, ore = ore, cre
-            cim, oim = oim, cim
+            cre, cim, ore, oim = transpose_planes!(cre, cim, ore, oim, B, h1p)
             _nd_core!(r, Y, _rawptr(Y), cre, cim, ore, oim, 1, false, true)
         end
     else
@@ -411,26 +373,11 @@ function (p::IrfftNdPlan{T,N})(y::Array{T,N}, X::Array{Complex{T},N}) where {T,N
             cre, cim, ore, oim =
                 _nd_core!(r, X, px, cre, cim, ore, oim, stagestart,
                           r.dim1_batched, false)
-            transpose_plane!(ore, cre, h1p, B)
-            transpose_plane!(oim, cim, h1p, B)
-            cre, ore = ore, cre
-            cim, oim = oim, cim
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, h1p, B)
             irfft_pre_batched!(ore, oim, cre, cim, B, h, p.r1.twr, p.r1.twi, p.bpre)
-            cre, ore = ore, cre
-            cim, oim = oim, cim
-            ncur = h
-            s = 1
-            for st in p.bstages
-                run_stage!(ore, oim, cre, cim, ncur, s * B, st, Val(1))
-                cre, ore = ore, cre
-                cim, oim = oim, cim
-                s *= st.radix
-                ncur ÷= st.radix
-            end
-            transpose_plane!(ore, cre, B, h)
-            transpose_plane!(oim, cim, B, h)
-            cre, ore = ore, cre
-            cim, oim = oim, cim
+            cre, cim, ore, oim =
+                run_chain!(ore, oim, cre, cim, p.bstages, h, 1, B, Val(1))
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, B, h)
             interleave_all!(reinterpret(Complex{T}, y), cre, cim, one(T))
         end
     else

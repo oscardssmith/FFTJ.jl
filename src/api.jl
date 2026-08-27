@@ -82,21 +82,9 @@ function Base.inv(s::Scaled)
 end
 
 # in-place one-shot transforms (out-of-place one-shots are in the N-d section)
-function fft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N}
-    p = plan_fft!(x)
-    p * x
-    return x
-end
-function ifft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N}
-    p = plan_ifft!(x)
-    p * x
-    return x
-end
-function bfft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N}
-    p = plan_bfft!(x)
-    p * x
-    return x
-end
+fft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N} = plan_fft!(x) * x
+ifft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N} = plan_ifft!(x) * x
+bfft!(x::Array{Complex{T},N}) where {T<:AbstractFloat,N} = plan_bfft!(x) * x
 
 # --- N-d array methods -------------------------------------------------------
 
@@ -117,19 +105,12 @@ function plan_ifft(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:Abstrac
     return N == 1 ? plan_ifft(T, length(x)) :
            _ndplan(T, size(x), +1, one(T) / length(x))
 end
-function plan_fft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
-    _checkregion_nd(region, N)
-    return InplacePlan(N == 1 ? plan_fft(T, length(x)) : _ndplan(T, size(x), -1, one(T)))
-end
-function plan_bfft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
-    _checkregion_nd(region, N)
-    return InplacePlan(N == 1 ? plan_bfft(T, length(x)) : _ndplan(T, size(x), +1, one(T)))
-end
-function plan_ifft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
-    _checkregion_nd(region, N)
-    return InplacePlan(N == 1 ? plan_ifft(T, length(x)) :
-                       _ndplan(T, size(x), +1, one(T) / length(x)))
-end
+plan_fft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N} =
+    InplacePlan(plan_fft(x, region; kws...))
+plan_bfft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N} =
+    InplacePlan(plan_bfft(x, region; kws...))
+plan_ifft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N} =
+    InplacePlan(plan_ifft(x, region; kws...))
 function plan_rfft(x::Array{T,N}, region=1:N; kws...) where {T<:AbstractFloat,N}
     _checkregion_nd(region, N)
     return N == 1 ? plan_rfft(T, length(x)) : _ndrfft(T, size(x))

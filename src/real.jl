@@ -5,7 +5,6 @@
 
 struct RfftPlan{T,P}
     n::Int
-    even::Bool
     inner::P                  # length n÷2 (even) or n (odd) forward plan
     twr::Vector{T}            # e^{-2πik/n}, k = 0..n÷2 (even case)
     twi::Vector{T}
@@ -15,7 +14,6 @@ end
 
 struct IrfftPlan{T,P}
     n::Int
-    even::Bool
     inner::P                  # length n÷2 (even) or n (odd) inverse plan
     pre::T                    # pre-pass pair factor: 1/2 (irfft) or 1 (brfft)
     twr::Vector{T}            # e^{+2πik/n}, k = 0..n÷2-1 (even case)
@@ -26,18 +24,16 @@ end
 
 const _RTW_CACHE = Dict{Tuple{DataType,Int,Int,Int},Any}()
 function real_twiddles(::Type{T}, n::Int, len::Int, D::Int) where {T}
-    r = lock(_PLAN_CACHE_LOCK) do
-        get!(_RTW_CACHE, (T, n, len, D)) do
-            twr = Vector{T}(undef, len)
-            twi = Vector{T}(undef, len)
-            for k in 0:len-1
-                θ = D * (Float64(2k) / n)
-                si, co = sincospi(θ)
-                twr[k+1] = T(co)
-                twi[k+1] = T(si)
-            end
-            (twr, twi)
+    r = _cached(_RTW_CACHE, (T, n, len, D)) do
+        twr = Vector{T}(undef, len)
+        twi = Vector{T}(undef, len)
+        for k in 0:len-1
+            θ = D * (Float64(2k) / n)
+            si, co = sincospi(θ)
+            twr[k+1] = T(co)
+            twi[k+1] = T(si)
         end
+        (twr, twi)
     end
     return r::Tuple{Vector{T},Vector{T}}
 end
@@ -45,19 +41,13 @@ end
 function plan_rfft(::Type{T}, n::Integer) where {T<:AbstractFloat}
     n = Int(n)
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
-    if iseven(n)
-        h = n >>> 1
-        twr, twi = real_twiddles(T, n, h + 1, -1)
-        inner = _anyplan(T, h, -1)
-        return RfftPlan{T,typeof(inner)}(n, true, inner, twr, twi,
-                                         Vector{Complex{T}}(undef, h),
-                                         Vector{Complex{T}}(undef, 0))
-    else
-        inner = _anyplan(T, n, -1)
-        return RfftPlan{T,typeof(inner)}(n, false, inner, T[], T[],
-                                         Vector{Complex{T}}(undef, n),
-                                         Vector{Complex{T}}(undef, n))
-    end
+    even = iseven(n)
+    len = even ? n >>> 1 : n
+    inner = _anyplan(T, len, -1)
+    twr, twi = even ? real_twiddles(T, n, len + 1, -1) : (T[], T[])
+    return RfftPlan{T,typeof(inner)}(n, inner, twr, twi,
+                                     Vector{Complex{T}}(undef, len),
+                                     Vector{Complex{T}}(undef, even ? 0 : n))
 end
 
 # normalized = true gives irfft (1/n folded in); false gives FFTW-style brfft
@@ -67,19 +57,13 @@ function plan_irfft(::Type{T}, n::Integer; normalized::Bool=true) where {T<:Abst
     n = Int(n)
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
     pre = normalized ? T(0.5) : one(T)
-    if iseven(n)
-        h = n >>> 1
-        twr, twi = real_twiddles(T, n, max(h, 1), +1)
-        inner = normalized ? _anyplan(T, h, +1) : _anyplan(T, h, +1, one(T))
-        return IrfftPlan{T,typeof(inner)}(n, true, inner, pre, twr, twi,
-                                          Vector{Complex{T}}(undef, h),
-                                          Vector{Complex{T}}(undef, 0))
-    else
-        inner = normalized ? _anyplan(T, n, +1) : _anyplan(T, n, +1, one(T))
-        return IrfftPlan{T,typeof(inner)}(n, false, inner, pre, T[], T[],
-                                          Vector{Complex{T}}(undef, n),
-                                          Vector{Complex{T}}(undef, n))
-    end
+    even = iseven(n)
+    len = even ? n >>> 1 : n
+    inner = normalized ? _anyplan(T, len, +1) : _anyplan(T, len, +1, one(T))
+    twr, twi = even ? real_twiddles(T, n, len, +1) : (T[], T[])
+    return IrfftPlan{T,typeof(inner)}(n, inner, pre, twr, twi,
+                                      Vector{Complex{T}}(undef, len),
+                                      Vector{Complex{T}}(undef, even ? 0 : n))
 end
 
 plan_brfft(::Type{T}, n::Integer) where {T<:AbstractFloat} =
@@ -91,7 +75,7 @@ function (p::RfftPlan{T})(y::AbstractVector{Complex{T}}, x::AbstractVector{T}) w
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n ÷ 2 + 1 ||
         throw(DimensionMismatch("rfft output must have length $(n ÷ 2 + 1), got $(length(y))"))
-    if p.even
+    if iseven(n)
         h = n >>> 1
         Z = p.buf
         p.inner(Z, reinterpret(Complex{T}, x))
@@ -143,11 +127,8 @@ function (p::RfftPlan{T})(y::AbstractVector{Complex{T}}, x::AbstractVector{T}) w
             end
         end
     else
-        buf = p.buf
-        @inbounds for j in 1:n
-            buf[j] = Complex(x[j], zero(T))
-        end
-        p.inner(p.buf2, buf)
+        copyto!(p.buf, x)
+        p.inner(p.buf2, p.buf)
         copyto!(y, 1, p.buf2, 1, n ÷ 2 + 1)
     end
     return y
@@ -158,7 +139,7 @@ function (p::IrfftPlan{T})(y::AbstractVector{T}, X::AbstractVector{Complex{T}}) 
     length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
     length(X) == n ÷ 2 + 1 ||
         throw(DimensionMismatch("irfft input must have length $(n ÷ 2 + 1), got $(length(X))"))
-    if p.even
+    if iseven(n)
         h = n >>> 1
         Z = p.buf
         twr, twi = p.twr, p.twi

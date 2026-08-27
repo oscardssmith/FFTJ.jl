@@ -42,12 +42,14 @@ function make_stage(::Type{T}, radix::Int, n::Int, s::Int, D::Int;
         ms = m * s
         twr = Vector{T}(undef, (radix - 1) * ms)
         twi = Vector{T}(undef, (radix - 1) * ms)
-        for j in 1:radix-1, f in 1:ms
-            p = (f - 1) ÷ s
+        for j in 1:radix-1, p in 0:m-1
             θ = Tw(2 * D * p * j) / n   # angle in units of π: w = exp(iπθ)
             si, co = sincospi(θ)
-            twr[(j-1)*ms+f] = T(co)
-            twi[(j-1)*ms+f] = T(si)
+            base = (j - 1) * ms + p * s
+            for q in 1:s   # twiddle repeated per lane across the stride
+                twr[base+q] = T(co)
+                twi[base+q] = T(si)
+            end
         end
     else
         twr = Vector{T}(undef, (radix - 1) * m)
@@ -100,28 +102,27 @@ end
 # buffers are allocated fresh, so repeated planning at one size is cheap —
 # DSP-style code plans per call.
 const _PLAN_CACHE_LOCK = ReentrantLock()
+_cached(f, dict::Dict, key) = lock(() -> get!(f, dict, key), _PLAN_CACHE_LOCK)
+
 const _STAGE_CACHE = Dict{Tuple{DataType,Int,Int,Bool},Any}()
 function build_stages_cached(::Type{T}, n::Int, D::Int;
                              allow_small::Bool=true) where {T}
-    r = lock(_PLAN_CACHE_LOCK) do
-        get!(() -> build_stages(T, n, D; allow_small), _STAGE_CACHE,
-             (T, n, D, allow_small))
-    end
+    r = _cached(() -> build_stages(T, n, D; allow_small), _STAGE_CACHE,
+                (T, n, D, allow_small))
     return r::Tuple{Vector{Stage{T}},Int}
 end
 
-function _plan(::Type{T}, n::Int, D::Int,
-               scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
+# bufs shares another plan's scratch planes (safe when the two plans never
+# execute concurrently, e.g. Bluestein's sequential forward/inverse pair)
+function _plan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
+               bufs::Union{Nothing,NTuple{4,Vector{T}}}=nothing) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
-    stages, f = build_stages_cached(T, n, D)
-    W = pick_width(T)
-    slast = f > 1 ? n ÷ f : 0
-    fused = W > 1 && length(stages) ≥ 2 &&
-            stages[1].radix == 4 && stages[1].small && (n >>> 2) % W == 0 &&
-            f > 1 && slast ≥ W && slast % W == 0
-    return FFTPlan{T,D}(n, fused, stages,
-                        Vector{T}(undef, n), Vector{T}(undef, n),
-                        Vector{T}(undef, n), Vector{T}(undef, n), scale)
+    stages, _ = build_stages_cached(T, n, D)
+    if bufs === nothing
+        bufs = (Vector{T}(undef, n), Vector{T}(undef, n),
+                Vector{T}(undef, n), Vector{T}(undef, n))
+    end
+    return FFTPlan{T,D}(n, pencil_fused(T, n, stages), stages, bufs..., scale)
 end
 
 # A smooth length whose odd stages would run at scalar strides (small 2-part)
@@ -150,12 +151,12 @@ plan_bfft(::Type{T}, n::Integer) where {T<:AbstractFloat} =
 @inline function run_stage!(bre, bim, are, aim, ncur, s, st, d::Val)
     if st.radix == 4
         if st.small
+            # small layout only arises at s ∈ {1, 4}: radix-4 tower strides
+            # are powers of 4 and use_small requires s < W ≤ 16
             if s == 1
                 stage4_small!(bre, bim, are, aim, ncur, Val(1), st.twr, st.twi, d)
-            elseif s == 4
-                stage4_small!(bre, bim, are, aim, ncur, Val(4), st.twr, st.twi, d)
             else
-                stage4!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d)
+                stage4_small!(bre, bim, are, aim, ncur, Val(4), st.twr, st.twi, d)
             end
         else
             stage4!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d)
@@ -170,6 +171,33 @@ plan_bfft(::Type{T}, n::Integer) where {T<:AbstractFloat} =
         stage7!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d)
     else
         stage2!(bre, bim, are, aim, ncur, s, st.twr, st.twi)
+    end
+    return nothing
+end
+
+# run a stage chain, ping-ponging between the (cre,cim) and (ore,oim) planes;
+# effective stride is s·B (B = inner batch). Returns the final plane roles.
+@inline function run_chain!(cre, cim, ore, oim, stages, ncur::Int, s::Int,
+                            B::Int, d::Val)
+    @inbounds for st in stages
+        run_stage!(ore, oim, cre, cim, ncur, s * B, st, d)
+        cre, ore = ore, cre
+        cim, oim = oim, cim
+        s *= st.radix
+        ncur ÷= st.radix
+    end
+    return cre, cim, ore, oim
+end
+
+# fused final stage: twiddle-free power-of-two radix writing interleaved output
+@inline function run_last_stage!(py::Ptr{T}, are, aim, s::Int, radix::Int,
+                                 scale::T, d::Val) where {T}
+    if radix == 4
+        stage4_last!(py, are, aim, s, scale, d)
+    elseif radix == 8
+        stage8_last!(py, are, aim, s, scale, d)
+    else
+        stage2_last!(py, are, aim, s, scale)
     end
     return nothing
 end
@@ -195,47 +223,17 @@ function (p::FFTPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
             py = _rawptr(y)
             st1 = stages[1]
             stage4_first!(are, aim, px, n, st1.twr, st1.twi, Val(D))
-            ncur = n >>> 2
-            s = 4
-            @inbounds for i in 2:length(stages)-1
-                st = stages[i]
-                run_stage!(bre, bim, are, aim, ncur, s, st, Val(D))
-                are, bre = bre, are
-                aim, bim = bim, aim
-                s *= st.radix
-                ncur ÷= st.radix
-            end
+            are, aim, bre, bim =
+                run_chain!(are, aim, bre, bim, view(stages, 2:length(stages)-1),
+                           n >>> 2, 4, 1, Val(D))
             lastradix = stages[end].radix
-            if lastradix == 4
-                stage4_last!(py, are, aim, s, p.scale, Val(D))
-            elseif lastradix == 8
-                stage8_last!(py, are, aim, s, p.scale, Val(D))
-            else
-                stage2_last!(py, are, aim, s, p.scale)
-            end
+            run_last_stage!(py, are, aim, n ÷ lastradix, lastradix, p.scale, Val(D))
         end
         return y
     end
-    xs = reinterpret(T, x)
-    @inbounds for i in 1:n
-        are[i] = xs[2i-1]
-        aim[i] = xs[2i]
-    end
-    ncur = n
-    s = 1
-    @inbounds for st in p.stages
-        run_stage!(bre, bim, are, aim, ncur, s, st, Val(D))
-        are, bre = bre, are
-        aim, bim = bim, aim
-        s *= st.radix
-        ncur ÷= st.radix
-    end
-    scale = p.scale
-    ys = reinterpret(T, y)
-    @inbounds for i in 1:n
-        ys[2i-1] = scale * are[i]
-        ys[2i] = scale * aim[i]
-    end
+    deinterleave_all!(are, aim, x)
+    are, aim, bre, bim = run_chain!(are, aim, bre, bim, stages, n, 1, 1, Val(D))
+    interleave_all!(y, are, aim, p.scale)
     return y
 end
 
