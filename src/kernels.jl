@@ -6,9 +6,19 @@
 # mechanism for batched N-d passes)
 const PlaneVec{T} = Union{Vector{T},SubArray{T,1,Vector{T},Tuple{UnitRange{Int}},true}}
 
+# host vector register width in bits (SVE and other scalable extensions are
+# not detectable here, so aarch64 assumes 128-bit NEON)
+function _vector_bits()
+    Sys.ARCH === :x86_64 || return 128
+    CPUID = Base.BinaryPlatforms.CPUID
+    CPUID.test_cpu_feature(CPUID.JL_X86_avx512f) && return 512
+    CPUID.test_cpu_feature(CPUID.JL_X86_avx) && return 256
+    return 128
+end
+const VECTOR_BITS = _vector_bits()
+
 # native SIMD width used to vectorize stage loops (in elements of T)
-pick_width(::Type{Float64}) = 8
-pick_width(::Type{Float32}) = 16
+pick_width(::Type{T}) where {T<:Union{Float32,Float64}} = VECTOR_BITS ÷ (8 * sizeof(T))
 pick_width(::Type) = 1
 
 @inline function cmul(wr, wi, xr, xi)
