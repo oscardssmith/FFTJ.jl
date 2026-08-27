@@ -59,7 +59,10 @@ function make_stage(::Type{T}, radix::Int, n::Int, s::Int, D::Int) where {T}
     return Stage{T}(radix, small, twr, twi)
 end
 
-function _plan(::Type{T}, n::Int, D::Int) where {T<:AbstractFloat}
+default_scale(::Type{T}, n, D) where {T} = D == -1 ? one(T) : one(T) / n
+
+function _plan(::Type{T}, n::Int, D::Int,
+               scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
     fac = factor_smooth(n)
     fac === nothing && throw(ArgumentError("_plan requires a 7-smooth length (got $n)"))
@@ -85,7 +88,6 @@ function _plan(::Type{T}, n::Int, D::Int) where {T<:AbstractFloat}
         end
     end
     f > 1 && push!(stages, make_stage(T, f, ncur, s, D))
-    scale = D == -1 ? one(T) : one(T) / n
     W = pick_width(T)
     slast = f > 1 ? n ÷ f : 0
     fused = W > 1 && length(stages) ≥ 2 &&
@@ -96,12 +98,17 @@ function _plan(::Type{T}, n::Int, D::Int) where {T<:AbstractFloat}
                         Vector{T}(undef, n), Vector{T}(undef, n), scale)
 end
 
-function _anyplan(::Type{T}, n::Int, D::Int) where {T<:AbstractFloat}
+function _anyplan(::Type{T}, n::Int, D::Int,
+                  scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
-    return factor_smooth(n) === nothing ? _bluestein(T, n, D) : _plan(T, n, D)
+    return factor_smooth(n) === nothing ? _bluestein(T, n, D, scale) :
+                                          _plan(T, n, D, scale)
 end
 plan_fft(::Type{T}, n::Integer) where {T<:AbstractFloat} = _anyplan(T, Int(n), -1)
 plan_ifft(::Type{T}, n::Integer) where {T<:AbstractFloat} = _anyplan(T, Int(n), +1)
+# unnormalized inverse (like FFTW's bfft)
+plan_bfft(::Type{T}, n::Integer) where {T<:AbstractFloat} =
+    _anyplan(T, Int(n), +1, one(T))
 
 @inline function run_stage!(bre, bim, are, aim, ncur, s, st, d::Val)
     if st.radix == 4

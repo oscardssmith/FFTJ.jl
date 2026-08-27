@@ -1,6 +1,6 @@
 using Test, FFTJ
 import FFTW
-using LinearAlgebra: norm
+using LinearAlgebra: norm, mul!
 using Random: Xoshiro
 
 @testset "complex fft/ifft vs FFTW ($T)" for T in (Float32, Float64)
@@ -95,6 +95,72 @@ end
             @test (@allocated pinv(x2, y)) == 0
         end
     end
+end
+
+@testset "FFTW-compat API ($T, n=$n)" for T in (Float32, Float64), n in (96, 11)
+    rng = Xoshiro(0xc0a7)
+    tol(ref) = 100 * eps(T) * max(norm(ref), one(T))
+    x = randn(rng, Complex{T}, n)
+    xr = randn(rng, T, n)
+
+    # array-based planning, * and mul!
+    p = plan_fft(x; flags=:ignored)
+    @test p * x ≈ FFTW.fft(x) atol = tol(FFTW.fft(x))
+    y = similar(x)
+    @test mul!(y, p, x) === y
+    @test y ≈ FFTW.fft(x) atol = tol(FFTW.fft(x))
+
+    # unnormalized backward
+    pb = plan_bfft(x)
+    @test pb * x ≈ FFTW.bfft(x) atol = tol(FFTW.bfft(x))
+
+    # in-place: DSP's complex conv idiom `p! * buf; ...; inv(p!).p`
+    p! = plan_fft!(x)
+    z = copy(x)
+    @test (p! * z) === z
+    @test z ≈ FFTW.fft(x) atol = tol(FFTW.fft(x))
+    ip = inv(p!).p
+    @test (ip * z) === z
+    @test z ≈ T(n) .* x atol = tol(n .* x)
+    ipfull = inv(p!)
+    z2 = copy(x)
+    p! * z2
+    ipfull * z2
+    @test z2 ≈ x atol = tol(x)
+
+    # rfft/brfft: DSP's _fftfilt!/dpss idiom
+    pr = plan_rfft(xr)
+    X = pr * xr
+    @test X ≈ FFTW.rfft(xr) atol = tol(FFTW.rfft(xr))
+    pbr = plan_brfft(X, n)
+    @test pbr * X ≈ FFTW.brfft(X, n) atol = tol(FFTW.brfft(X, n))
+    yr = similar(xr)
+    @test mul!(yr, pbr, X) === yr
+    @test yr ≈ FFTW.brfft(X, n) atol = tol(FFTW.brfft(X, n))
+
+    # hilbert idiom: mul! into a view of a longer buffer
+    if iseven(n)
+        Xbig = zeros(Complex{T}, n)
+        mul!(view(Xbig, 1:(n >> 1) + 1), pr, xr)
+        @test Xbig[1:(n >> 1) + 1] ≈ FFTW.rfft(xr) atol = tol(FFTW.rfft(xr))
+    end
+
+    # one-shot functions
+    @test fft(x) ≈ FFTW.fft(x) atol = tol(FFTW.fft(x))
+    @test ifft(x) ≈ FFTW.ifft(x) atol = tol(FFTW.ifft(x))
+    @test bfft(x) ≈ FFTW.bfft(x) atol = tol(FFTW.bfft(x))
+    @test rfft(xr) ≈ FFTW.rfft(xr) atol = tol(FFTW.rfft(xr))
+    @test irfft(X, n) ≈ FFTW.irfft(X, n) atol = tol(FFTW.irfft(X, n))
+    @test brfft(X, n) ≈ FFTW.brfft(X, n) atol = tol(FFTW.brfft(X, n))
+    @test ifft!(copy(x)) ≈ FFTW.ifft(x) atol = tol(FFTW.ifft(x))
+    @test fft!(copy(x)) ≈ FFTW.fft(x) atol = tol(FFTW.fft(x))
+
+    # re-exported utilities
+    @test fftshift(fftfreq(4)) == [-0.5, -0.25, 0.0, 0.25]
+    @test rfftfreq(n) isa Frequencies
+
+    # region validation
+    @test_throws ArgumentError plan_fft(x, 2)
 end
 
 @testset "argument checking" begin

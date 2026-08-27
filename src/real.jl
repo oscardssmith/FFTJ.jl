@@ -17,6 +17,7 @@ struct IrfftPlan{T,P}
     n::Int
     even::Bool
     inner::P                  # length n÷2 (even) or n (odd) inverse plan
+    pre::T                    # pre-pass pair factor: 1/2 (irfft) or 1 (brfft)
     twr::Vector{T}            # e^{+2πik/n}, k = 0..n÷2-1 (even case)
     twi::Vector{T}
     buf::Vector{Complex{T}}   # Z (even) / full Hermitian spectrum (odd)
@@ -52,25 +53,33 @@ function plan_rfft(::Type{T}, n::Integer) where {T<:AbstractFloat}
     end
 end
 
-function plan_irfft(::Type{T}, n::Integer) where {T<:AbstractFloat}
+# normalized = true gives irfft (1/n folded in); false gives FFTW-style brfft
+# (unnormalized: brfft = n·irfft, via an unnormalized inner transform and a
+# pre-pass pair factor of 1 instead of 1/2).
+function plan_irfft(::Type{T}, n::Integer; normalized::Bool=true) where {T<:AbstractFloat}
     n = Int(n)
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
+    pre = normalized ? T(0.5) : one(T)
     if iseven(n)
         h = n >>> 1
         twr, twi = real_twiddles(T, n, max(h, 1), +1)
-        inner = _anyplan(T, h, +1)
-        return IrfftPlan{T,typeof(inner)}(n, true, inner, twr, twi,
+        inner = normalized ? _anyplan(T, h, +1) : _anyplan(T, h, +1, one(T))
+        return IrfftPlan{T,typeof(inner)}(n, true, inner, pre, twr, twi,
                                           Vector{Complex{T}}(undef, h),
                                           Vector{Complex{T}}(undef, 0))
     else
-        inner = _anyplan(T, n, +1)
-        return IrfftPlan{T,typeof(inner)}(n, false, inner, T[], T[],
+        inner = normalized ? _anyplan(T, n, +1) : _anyplan(T, n, +1, one(T))
+        return IrfftPlan{T,typeof(inner)}(n, false, inner, pre, T[], T[],
                                           Vector{Complex{T}}(undef, n),
                                           Vector{Complex{T}}(undef, n))
     end
 end
 
-function (p::RfftPlan{T})(y::Vector{Complex{T}}, x::Vector{T}) where {T}
+plan_brfft(::Type{T}, n::Integer) where {T<:AbstractFloat} =
+    plan_irfft(T, n; normalized=false)
+
+# y may be a contiguous view (e.g. the leading half of a longer spectrum buffer)
+function (p::RfftPlan{T})(y::AbstractVector{Complex{T}}, x::Vector{T}) where {T}
     n = p.n
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n ÷ 2 + 1 ||
@@ -146,7 +155,7 @@ function (p::IrfftPlan{T})(y::Vector{T}, X::Vector{Complex{T}}) where {T}
         h = n >>> 1
         Z = p.buf
         twr, twi = p.twr, p.twi
-        half = T(0.5)
+        half = p.pre
         W = pick_width(T)
         if W > 1 && h ≥ W
             # k blocks over 0:h-1; partner h-k loaded ascending, lane-reversed.

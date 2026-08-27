@@ -40,7 +40,8 @@ struct BluesteinPlan{T,D}
     scale::T
 end
 
-function _bluestein(::Type{T}, n::Int, D::Int) where {T<:AbstractFloat}
+function _bluestein(::Type{T}, n::Int, D::Int,
+                    scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
     N = nextsmooth(2n - 1)
     c = chirp(T, n, D)
     g = zeros(Complex{T}, N)
@@ -53,7 +54,6 @@ function _bluestein(::Type{T}, n::Int, D::Int) where {T<:AbstractFloat}
     pf = _plan(T, N, -1)
     pinv = _plan(T, N, +1)
     ghat = pf(g)
-    scale = D == -1 ? one(T) : one(T) / n
     return BluesteinPlan{T,D}(n, c, ghat, pf, pinv,
                               Vector{Complex{T}}(undef, N),
                               Vector{Complex{T}}(undef, N), scale)
