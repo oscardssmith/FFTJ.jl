@@ -9,6 +9,29 @@ if !@isdefined(FFTJ)
     using Random: Xoshiro
 end
 
+# The same algorithm tree as p with every task count forced to 1 — the
+# bitwise reference for threaded plans. (plan_* with nthreads=1 can pick a
+# different algorithm: routing legitimately depends on the task count, e.g.
+# four-step only pays when threaded.)
+serial_like(p::FFTJ.FFTPlan{T,D}) where {T,D} =
+    FFTJ._plan(T, p.n, D, p.scale; nthreads=1)
+serial_like(p::FFTJ.FourStepPlan{T,D}) where {T,D} =
+    FFTJ._fourstep(T, p.n, D, p.scale; nthreads=1)
+serial_like(p::FFTJ.BluesteinPlan{T,D}) where {T,D} =
+    FFTJ.BluesteinPlan{T,D}(p.n, p.c, p.ghat, serial_like(p.pf),
+                            serial_like(p.pinv), similar(p.a), similar(p.b),
+                            p.scale)
+function serial_like(p::FFTJ.RfftPlan{T}) where {T}
+    inner = serial_like(p.inner)
+    return FFTJ.RfftPlan{T,typeof(inner)}(p.n, inner, p.twr, p.twi,
+                                          similar(p.buf), similar(p.buf2))
+end
+function serial_like(p::FFTJ.IrfftPlan{T}) where {T}
+    inner = serial_like(p.inner)
+    return FFTJ.IrfftPlan{T,typeof(inner)}(p.n, inner, p.pre, p.twr, p.twi,
+                                           similar(p.buf), similar(p.buf2))
+end
+
 @testset "tforeach chunking" begin
     lk = ReentrantLock()
     @testset "exact cover: len=$len nt=$nt align=$align" for len in (0, 1, 5, 16, 100, 1000),
@@ -50,30 +73,37 @@ end
     rng = Xoshiro(0x7472)
     # 2^20: fused radix-4 chain; 2^19: radix-8 last stage; 3·2^18: radix-3
     # stage; 3^4·5·7·2^10: all odd radices; 1441440: radix-11/13 stages;
-    # 1000003: prime → Bluestein
-    ns = [2^20, 2^19, 3 * 2^18, 3^4 * 5 * 7 * 2^10, 1441440, 1000003]
+    # 2^22 and 3·2^21: four-step; 1000003: prime → Bluestein (four-step inner)
+    ns = [2^20, 2^19, 3 * 2^18, 3^4 * 5 * 7 * 2^10, 1441440, 2^22, 3 * 2^21,
+          1000003]
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         p1 = plan_fft(T, n; nthreads=1)
         pt = plan_fft(T, n)
         Threads.nthreads() > 1 && @test FFTJ.plan_nt(pt) > 1
-        y1 = p1(x)
+        p1s = serial_like(pt)
         yt = pt(x)
-        @test yt == y1                # bitwise-identical to serial
+        @test yt == p1s(x)            # bitwise-identical to same-algorithm serial
         @test pt(x) == yt             # deterministic across executions
         ref = FFTW.fft(ComplexF64.(x))
         @test norm(yt .- ref) ≤ 100 * eps(T) * norm(ref)
+        @test norm(p1(x) .- ref) ≤ 100 * eps(T) * norm(ref)
 
         pt_inv = plan_ifft(T, n)
-        @test pt_inv(yt) == plan_ifft(T, n; nthreads=1)(yt)
+        @test pt_inv(yt) == serial_like(pt_inv)(yt)
         @test norm(pt_inv(yt) .- x) ≤ 100 * eps(T) * norm(x)
-        @test plan_bfft(T, n)(yt) == plan_bfft(T, n; nthreads=1)(yt)
+        ptb = plan_bfft(T, n)
+        @test ptb(yt) == serial_like(ptb)(yt)
 
-        # an explicit nthreads=1 plan stays allocation-free at big sizes
+        # serial execution stays allocation-free at big sizes, for both the
+        # public nthreads=1 plan and the threaded plan's algorithm
         y2 = similar(x)
         p1(y2, x)
         p1(y2, x)
         @test (@allocated p1(y2, x)) == 0
+        p1s(y2, x)
+        p1s(y2, x)
+        @test (@allocated p1s(y2, x)) == 0
     end
 end
 
@@ -123,15 +153,17 @@ end
         pr1 = plan_rfft(T, n; nthreads=1)
         prt = plan_rfft(T, n)
         Threads.nthreads() > 1 && @test FFTJ.plan_nt(prt) > 1
-        X1 = pr1(x)
         Xt = prt(x)
-        @test Xt == X1
+        @test Xt == serial_like(prt)(x)
         ref = FFTW.rfft(Float64.(x))
         @test norm(Xt .- ref) ≤ 100 * eps(T) * norm(ref)
+        @test norm(pr1(x) .- ref) ≤ 100 * eps(T) * norm(ref)
 
-        @test plan_irfft(T, n)(Xt) == plan_irfft(T, n; nthreads=1)(Xt)
-        @test norm(plan_irfft(T, n)(Xt) .- x) ≤ 100 * eps(T) * norm(x)
-        @test plan_brfft(T, n)(Xt) == plan_brfft(T, n; nthreads=1)(Xt)
+        pit = plan_irfft(T, n)
+        @test pit(Xt) == serial_like(pit)(Xt)
+        @test norm(pit(Xt) .- x) ≤ 100 * eps(T) * norm(x)
+        pbt = plan_brfft(T, n)
+        @test pbt(Xt) == serial_like(pbt)(Xt)
 
         X2 = similar(Xt)
         pr1(X2, x)

@@ -5,7 +5,7 @@
 # versa); AbstractFFTs is used only for its backend-neutral utilities
 # (fftshift, fftfreq, ...), which are re-exported.
 
-const AnyPlan{T} = Union{FFTPlan{T},BluesteinPlan{T}}
+const AnyPlan{T} = Union{FFTPlan{T},BluesteinPlan{T},FourStepPlan{T}}
 
 # In-place complex plans. Execution is alias-safe (the input is fully consumed
 # into scratch before the output is written), so these wrap ordinary plans.
@@ -60,6 +60,7 @@ Base.size(ip::InplacePlan) = size(ip.p)
 
 _dir(::FFTPlan{T,D}) where {T,D} = D
 _dir(::BluesteinPlan{T,D}) where {T,D} = D
+_dir(::FourStepPlan{T,D}) where {T,D} = D
 
 # inv: forward ↦ scaled unnormalized backward (so inv(p).p is unnormalized,
 # matching DSP's inv(plan_fft!(x)).p idiom); normalized inverse ↦ plain

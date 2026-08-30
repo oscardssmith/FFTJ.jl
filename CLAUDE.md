@@ -118,5 +118,11 @@ Threading (threads.jl; design: docs/superpowers/specs/2026-08-30-fftj-threading-
   non-batched real path has a known pre-existing 32 B/pencil wrapper
   allocation independent of threading.
 - Scaling is bandwidth-bound: good while the working set is cache-resident
-  (~2–3× on 4 cores up to ~2^20), collapses at 2^22+ where FFTW's cache
-  blocking wins — a four-step decomposition is the known (deferred) fix.
+  (~2–3× on 4 cores up to ~2^20). Above FOURSTEP_MIN (2^21), *threaded*
+  smooth plans route to the four-step/six-step `FourStepPlan` (fourstep.jl):
+  3 transposes + 2 cache-resident pencil-FFT phases with a fused twiddle,
+  measured 0.74–0.85× direct at 4t. Serial plans stay direct — one core
+  can't saturate DRAM, so four-step's extra sweeps lose serially (1.1–1.7×).
+  Routing therefore depends on the effective task count; the bitwise
+  threaded==serial tests compare against a same-algorithm serial plan
+  (`serial_like` in test/threading.jl), not `plan_*(...; nthreads=1)`.

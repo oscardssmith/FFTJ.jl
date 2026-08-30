@@ -30,12 +30,17 @@ function chirp(::Type{T}, n::Int, D::Int) where {T}
     return c
 end
 
+# The inner length-N plans are FFTPlan below FOURSTEP_MIN and FourStepPlan
+# above (Bluestein's padded lengths are exactly the cache-hostile sizes).
+# Concrete two-type Union fields keep BluesteinPlan{T,D} concrete — a type
+# parameter here would make N-d DimPass.fallback's union non-concrete and
+# send every fallback pass through boxing dynamic dispatch.
 struct BluesteinPlan{T,D}
     n::Int
     c::Vector{Complex{T}}     # chirp
     ghat::Vector{Complex{T}}  # fft_N of the wrapped kernel conj(c)
-    pf::FFTPlan{T,-1}
-    pinv::FFTPlan{T,1}
+    pf::Union{FFTPlan{T,-1},FourStepPlan{T,-1}}
+    pinv::Union{FFTPlan{T,1},FourStepPlan{T,1}}
     a::Vector{Complex{T}}     # length-N work buffers
     b::Vector{Complex{T}}
     scale::T
@@ -50,7 +55,7 @@ function _bluestein_parts(::Type{T}, n::Int, D::Int) where {T}
         g = zeros(Complex{T}, N)
         g[1:n] .= conj.(c)
         g[N-n+2:N] .= conj.(view(c, n:-1:2))   # kernel wraps: g[N-j+1] = conj(c[j+1])
-        (N, c, _plan(T, N, -1)(g))
+        (N, c, _smoothplan(T, N, -1)(g))
     end
     return r::Tuple{Int,Vector{Complex{T}},Vector{Complex{T}}}
 end
@@ -58,9 +63,9 @@ end
 function _bluestein(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                     nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     N, c, ghat = _bluestein_parts(T, n, D)
-    pf = _plan(T, N, -1; nthreads)
+    pf = _smoothplan(T, N, -1; nthreads)
     # pf and pinv only ever run sequentially, so they share scratch planes
-    pinv = _plan(T, N, +1; bufs=(pf.are, pf.aim, pf.bre, pf.bim), nthreads)
+    pinv = _smoothplan(T, N, +1; bufs=(pf.are, pf.aim, pf.bre, pf.bim), nthreads)
     return BluesteinPlan{T,D}(n, c, ghat, pf, pinv,
                               Vector{Complex{T}}(undef, N),
                               Vector{Complex{T}}(undef, N), scale)

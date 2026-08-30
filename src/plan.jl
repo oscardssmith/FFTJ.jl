@@ -167,7 +167,7 @@ function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
     if factor_radices(n) === nothing || _slow_smooth(T, n)
         return _bluestein(T, n, D, scale; nthreads)
     end
-    return _plan(T, n, D, scale; nthreads)
+    return _smoothplan(T, n, D, scale; nthreads)
 end
 plan_fft(::Type{T}, n::Integer; nthreads::Integer=Threads.nthreads()) where {T<:AbstractFloat} =
     _anyplan(T, Int(n), -1; nthreads=Int(nthreads))
