@@ -106,7 +106,10 @@ function build_stages(::Type{T}, n::Int, D::Int; allow_small::Bool=true) where {
         s *= 4
         ncur >>>= 2
     end
-    for (radix, cnt) in ps
+    # odd stages run smallest radix first: when the 2-part is small the first
+    # odd stage inherits a stride < W (scalar path), and a scalar radix-3
+    # butterfly is nearly free while a scalar radix-13 one is ruinous
+    for (radix, cnt) in Iterators.reverse(ps)
         for _ in 1:cnt
             push!(stages, make_stage(T, radix, ncur, s, D; allow_small))
             s *= radix
