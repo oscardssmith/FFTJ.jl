@@ -38,14 +38,22 @@ the edges (fused into the first/last stage when possible). The type parameter
 
 Pipeline for a 1-D transform of length n:
 
-- **7-smooth n** (2^a·3^b·5^c·7^d): a Stockham autosort chain of `Stage`s built
-  by `build_stages` (plan.jl). Order matters: the radix-4 tower runs first so
-  odd-radix stages see large SIMD-divisible strides; the final stage is a
-  twiddle-free power-of-two radix (2/4/8) that can be fused with output
-  interleaving. Stages ping-pong between two plane pairs via `run_chain!`.
-- **non-smooth n** (or smooth-but-slow, see `_slow_smooth`): Bluestein's
-  algorithm (bluestein.jl) over a padded length from `nextsmooth` (small odd
-  part × large power of two), reusing two ordinary `FFTPlan`s.
+- **n factoring over the radix set** (2^a times odd primes in `ODD_RADICES`,
+  currently {3,5,7,11,13}): a Stockham autosort chain of `Stage`s built by
+  `build_stages` (plan.jl). Order matters: the radix-4 tower runs first so
+  odd-radix stages see large SIMD-divisible strides (odd stages run largest
+  radix first); the final stage is a twiddle-free power-of-two radix (2/4/8)
+  that can be fused with output interleaving. Stages ping-pong between two
+  plane pairs via `run_chain!`. All odd radices go through the `@generated`
+  conjugate-symmetric-pairing butterfly `bfp` (kernels.jl), measured equal to
+  the formerly handwritten 3/5/7 kernels — but only after two traps were
+  fixed: `@inbounds` does not propagate into `ntuple` closures (bounds checks
+  cost ~20% at radix 5), and tuple `map`/runtime-length `ntuple` allocate
+  past inference limits.
+- **n with larger prime factors** (or wide-vector-Float32 small odd sizes,
+  see `_slow_smooth`): Bluestein's algorithm (bluestein.jl) over a padded
+  length from `nextsmooth` (small odd part × large power of two), reusing two
+  ordinary `FFTPlan`s.
 - **real transforms** (real.jl): even n packs input as n/2 complex points via
   reinterpret (no copy) + O(n) even/odd split post-pass; odd n falls back to a
   full complex transform.

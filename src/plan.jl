@@ -10,15 +10,27 @@ use_small(::Type{T}, radix::Int, m::Int, s::Int) where {T} =
     radix == 4 && s < pick_width(T) && m * s ≥ pick_width(T) &&
     (m * s) % pick_width(T) == 0
 
-# factor n = 2^a·3^b·5^c·7^d, or nothing when n is not 7-smooth
-function factor_smooth(n::Int)
+# odd primes the direct engine has stage kernels for, largest first (the
+# order odd stages run in, after the radix-4 tower); 11/13 go through the
+# generic bfp butterfly, 7/5/3 through their handwritten kernels
+const ODD_RADICES = (13, 11, 7, 5, 3)
+
+# factor n = 2^a · Π p^c over ODD_RADICES (largest first, matching stage
+# order), or nothing when a larger prime remains
+function factor_radices(n::Int)
     a = trailing_zeros(n)
     r = n >> a
-    b = 0; while r % 3 == 0; r ÷= 3; b += 1; end
-    c = 0; while r % 5 == 0; r ÷= 5; c += 1; end
-    d = 0; while r % 7 == 0; r ÷= 7; d += 1; end
+    ps = Pair{Int,Int}[]
+    for p in ODD_RADICES
+        c = 0
+        while r % p == 0
+            r ÷= p
+            c += 1
+        end
+        c > 0 && push!(ps, p => c)
+    end
     r == 1 || return nothing
-    return a, b, c, d
+    return a, ps
 end
 
 # D: sign of the transform exponent (-1 forward, +1 inverse)
@@ -73,15 +85,17 @@ end
 
 default_scale(::Type{T}, n, D) where {T} = D == -1 ? one(T) : one(T) / n
 
-# The 1-D stage chain for a 7-smooth n: final power-of-two stage f (m == 1,
-# twiddle-free, fusable); the rest of the 2-part runs as a radix-4 tower
-# first, so the odd-radix stages in between see large W-divisible strides.
-# allow_small=false suppresses the small-stride twiddle layout (batched N-d
-# passes run every stage at effective stride s·Bi ≥ W, never the small path).
+# The 1-D stage chain for an n factoring over ODD_RADICES: final power-of-two
+# stage f (m == 1, twiddle-free, fusable); the rest of the 2-part runs as a
+# radix-4 tower first, so the odd-radix stages in between see large
+# W-divisible strides. allow_small=false suppresses the small-stride twiddle
+# layout (batched N-d passes run every stage at effective stride s·Bi ≥ W,
+# never the small path).
 function build_stages(::Type{T}, n::Int, D::Int; allow_small::Bool=true) where {T}
-    fac = factor_smooth(n)
-    fac === nothing && throw(ArgumentError("build_stages requires a 7-smooth length (got $n)"))
-    a, b3, c5, d7 = fac
+    fac = factor_radices(n)
+    fac === nothing &&
+        throw(ArgumentError("build_stages requires a length with prime factors ≤ $(ODD_RADICES[1]) (got $n)"))
+    a, ps = fac
     f = a == 0 ? 1 : isodd(a) ? (a ≥ 3 ? 8 : 2) : 4
     k4 = (a - trailing_zeros(f)) ÷ 2
     stages = Stage{T}[]
@@ -92,7 +106,7 @@ function build_stages(::Type{T}, n::Int, D::Int; allow_small::Bool=true) where {
         s *= 4
         ncur >>>= 2
     end
-    for (radix, cnt) in ((7, d7), (5, c5), (3, b3))
+    for (radix, cnt) in ps
         for _ in 1:cnt
             push!(stages, make_stage(T, radix, ncur, s, D; allow_small))
             s *= radix
@@ -141,17 +155,16 @@ end
 # keeps the Bluestein route, for the small odd-heavy sizes where odd stages
 # run at scalar strides: crossover measured between 3^8 = 6561 (Bluestein
 # 1.4× ahead) and 14175 (direct 1.5× ahead).
-function _slow_smooth(::Type{T}, n::Int, fac) where {T}
-    a, b, c, d = fac
+function _slow_smooth(::Type{T}, n::Int) where {T}
     W = pick_width(T)
-    return W ≥ 16 && b + c + d > 0 && 256 ≤ n ≤ 8192 && (1 << a) < 4 * W
+    a = trailing_zeros(n)
+    return W ≥ 16 && n >> a > 1 && 256 ≤ n ≤ 8192 && (1 << a) < 4 * W
 end
 
 function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                   nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
-    fac = factor_smooth(n)
-    if fac === nothing || _slow_smooth(T, n, fac)
+    if factor_radices(n) === nothing || _slow_smooth(T, n)
         return _bluestein(T, n, D, scale; nthreads)
     end
     return _plan(T, n, D, scale; nthreads)
@@ -181,11 +194,15 @@ plan_bfft(::Type{T}, n::Integer; nthreads::Integer=Threads.nthreads()) where {T<
     elseif st.radix == 8
         stage8_plain!(bre, bim, are, aim, s, d)
     elseif st.radix == 3
-        stage3!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d)
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(3), d)
     elseif st.radix == 5
-        stage5!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d)
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(5), d)
     elseif st.radix == 7
-        stage7!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d)
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(7), d)
+    elseif st.radix == 11
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(11), d)
+    elseif st.radix == 13
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(13), d)
     else
         stage2!(bre, bim, are, aim, ncur, s, st.twr, st.twi)
     end
@@ -235,11 +252,15 @@ end
     if radix == 4
         stage4!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d, pr, qr)
     elseif radix == 3
-        stage3!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d, pr, qr)
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(3), d, pr, qr)
     elseif radix == 5
-        stage5!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d, pr, qr)
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(5), d, pr, qr)
     elseif radix == 7
-        stage7!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d, pr, qr)
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(7), d, pr, qr)
+    elseif radix == 11
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(11), d, pr, qr)
+    elseif radix == 13
+        stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(13), d, pr, qr)
     else
         stage2!(bre, bim, are, aim, ncur, s, st.twr, st.twi, pr, qr)
     end

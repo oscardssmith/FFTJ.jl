@@ -49,8 +49,9 @@ end
 @testset "threaded 1-D complex vs serial ($T)" for T in (Float32, Float64)
     rng = Xoshiro(0x7472)
     # 2^20: fused radix-4 chain; 2^19: radix-8 last stage; 3·2^18: radix-3
-    # stage; 3^4·5·7·2^10: all odd radices; 1000003: prime → Bluestein
-    ns = [2^20, 2^19, 3 * 2^18, 3^4 * 5 * 7 * 2^10, 1000003]
+    # stage; 3^4·5·7·2^10: all odd radices; 1441440: radix-11/13 stages;
+    # 1000003: prime → Bluestein
+    ns = [2^20, 2^19, 3 * 2^18, 3^4 * 5 * 7 * 2^10, 1441440, 1000003]
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         p1 = plan_fft(T, n; nthreads=1)

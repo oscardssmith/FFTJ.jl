@@ -61,7 +61,7 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
         nd == 1 && continue
         Bi = prod(dims[1:d-1])
         Bo = prod(dims[d+1:N])
-        if factor_smooth(nd) !== nothing
+        if factor_radices(nd) !== nothing
             stages, _ = build_stages_cached(T, nd, D; allow_small=Bi == 1)
             # dim-1 chains that don't earn the fused-edge treatment run
             # transposed, with pencils as vector lanes, on a no-small chain
@@ -370,7 +370,7 @@ function _real_batched(::Type{T}, n1::Int, B::Int) where {T}
     W = pick_width(T)
     (W > 1 && iseven(n1) && n1 ≥ 2 && B ≥ W) || return false
     h = n1 >>> 1
-    factor_smooth(h) === nothing && return false
+    factor_radices(h) === nothing && return false
     stages, _ = build_stages_cached(T, h, -1)
     pencil_fused(T, h, stages) || return true
     # measured crossover: with fused pencils available, the transpose overhead

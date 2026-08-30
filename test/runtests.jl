@@ -38,7 +38,11 @@ end
     rng = Xoshiro(0x357)
     ns = [3, 5, 6, 7, 9, 10, 12, 14, 15, 20, 21, 24, 25, 27, 35, 45, 48, 49, 60,
           63, 105, 120, 315, 27 * 32, 3 * 2^8, 9 * 2^8, 5 * 2^8, 7 * 2^8,
-          15 * 2^7, 105 * 2^4, 5^3 * 2^6, 7^2 * 2^6, 3^4 * 5 * 7 * 2^5]
+          15 * 2^7, 105 * 2^4, 5^3 * 2^6, 7^2 * 2^6, 3^4 * 5 * 7 * 2^5,
+          # radix-11/13 stages (generic odd-prime butterfly), incl. scalar
+          # strides (429), repeated primes, and all radices at once
+          11, 13, 22, 26, 429, 352, 416, 1001, 11^2 * 2^4, 13^2 * 2^4,
+          2^4 * 3^2 * 11 * 13, 3 * 5 * 7 * 11 * 13 * 2^4]
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         ref = FFTW.fft(ComplexF64.(x))

@@ -254,159 +254,83 @@ function stage2_last!(py::Ptr{T}, xre::PlaneVec{T}, xim::PlaneVec{T}, s::Int,
     return nothing
 end
 
-# Odd-radix stages. These run after the radix-4 tower, so s is large for all
-# but tiny n (scalar fallback otherwise).
-function stage3!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D},
-                 prange::UnitRange{Int}=0:(n ÷ 3)-1,
-                 qrange::UnitRange{Int}=1:s) where {T,D}
-    m = n ÷ 3
-    ms = m * s
-    k = T(D * sqrt(0.75))
-    nh = T(-0.5)
-    W = pick_width(T)
-    if W > 1 && length(qrange) ≥ W
-        kv = Vec{W,T}(k); nhv = Vec{W,T}(nh)
-        @inbounds for p in prange
-            w1r = Vec{W,T}(twr[2p+1]); w1i = Vec{W,T}(twi[2p+1])
-            w2r = Vec{W,T}(twr[2p+2]); w2i = Vec{W,T}(twi[2p+2])
-            xb = s * p; yb = 3 * s * p
-            for q in QWin(qrange, W)
-                ys = bf3(vload(Vec{W,T}, xre, xb + q), vload(Vec{W,T}, xim, xb + q),
-                         vload(Vec{W,T}, xre, xb + ms + q), vload(Vec{W,T}, xim, xb + ms + q),
-                         vload(Vec{W,T}, xre, xb + 2ms + q), vload(Vec{W,T}, xim, xb + 2ms + q),
-                         kv, nhv)
-                vstore(ys[1], yre, yb + q); vstore(ys[2], yim, yb + q)
-                o1r, o1i = cmul(w1r, w1i, ys[3], ys[4])
-                vstore(o1r, yre, yb + s + q); vstore(o1i, yim, yb + s + q)
-                o2r, o2i = cmul(w2r, w2i, ys[5], ys[6])
-                vstore(o2r, yre, yb + 2s + q); vstore(o2i, yim, yb + 2s + q)
-            end
+# Unrolled twiddle-multiply-and-store of bfp outputs 1..P-1 (generated: a
+# runtime `for j in 1:P-1` with dynamic tuple indexing doesn't reliably
+# unroll, spilling the output tuple and taxing small radices)
+@generated function stagep_out!(yre, yim, ys::NTuple{L,Vec{W,T}},
+                                wr::NTuple{M,Vec{W,T}}, wi::NTuple{M,Vec{W,T}},
+                                yb::Int, s::Int, q::Int) where {L,W,T,M}
+    exs = [quote
+               or, oi = cmul(wr[$j], wi[$j], ys[$(2j + 1)], ys[$(2j + 2)])
+               vstore(or, yre, yb + $j * s + q)
+               vstore(oi, yim, yb + $j * s + q)
+           end for j in 1:M]
+    quote
+        $(Expr(:meta, :inline))
+        @inbounds begin
+            $(exs...)
         end
-    else
-        @inbounds for p in prange
-            w1r = twr[2p+1]; w1i = twi[2p+1]
-            w2r = twr[2p+2]; w2i = twi[2p+2]
-            xb = s * p; yb = 3 * s * p
-            for q in qrange
-                ys = bf3(xre[xb+q], xim[xb+q], xre[xb+ms+q], xim[xb+ms+q],
-                         xre[xb+2ms+q], xim[xb+2ms+q], k, nh)
-                yre[yb+q] = ys[1]; yim[yb+q] = ys[2]
-                o1r, o1i = cmul(w1r, w1i, ys[3], ys[4])
-                yre[yb+s+q] = o1r; yim[yb+s+q] = o1i
-                o2r, o2i = cmul(w2r, w2i, ys[5], ys[6])
-                yre[yb+2s+q] = o2r; yim[yb+2s+q] = o2i
-            end
-        end
+        return nothing
     end
-    return nothing
 end
 
-function stage5!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D},
-                 prange::UnitRange{Int}=0:(n ÷ 5)-1,
-                 qrange::UnitRange{Int}=1:s) where {T,D}
-    m = n ÷ 5
-    ms = m * s
-    c1 = T(cospi(0.4)); c2 = T(cospi(0.8))
-    s1 = T(D * sinpi(0.4)); s2 = T(D * sinpi(0.8))
-    W = pick_width(T)
-    if W > 1 && length(qrange) ≥ W
-        c1v = Vec{W,T}(c1); c2v = Vec{W,T}(c2); s1v = Vec{W,T}(s1); s2v = Vec{W,T}(s2)
-        @inbounds for p in prange
-            Base.Cartesian.@nexprs 4 j -> begin
-                wr_j = Vec{W,T}(twr[4p+j]); wi_j = Vec{W,T}(twi[4p+j])
-            end
-            xb = s * p; yb = 5 * s * p
-            for q in QWin(qrange, W)
-                Base.Cartesian.@nexprs 5 j -> begin
-                    xr_j = vload(Vec{W,T}, xre, xb + (j - 1) * ms + q)
-                    xi_j = vload(Vec{W,T}, xim, xb + (j - 1) * ms + q)
-                end
-                ys = bf5(xr_1, xi_1, xr_2, xi_2, xr_3, xi_3, xr_4, xi_4, xr_5, xi_5,
-                         c1v, c2v, s1v, s2v)
-                vstore(ys[1], yre, yb + q); vstore(ys[2], yim, yb + q)
-                Base.Cartesian.@nexprs 4 j -> begin
-                    or_j, oi_j = cmul(wr_j, wi_j, ys[2j+1], ys[2j+2])
-                    vstore(or_j, yre, yb + j * s + q); vstore(oi_j, yim, yb + j * s + q)
-                end
-            end
+@generated function stagep_out!(yre, yim, ys::NTuple{L,T},
+                                wr::NTuple{M,T}, wi::NTuple{M,T},
+                                yb::Int, s::Int, q::Int) where {L,T,M}
+    exs = [quote
+               or, oi = cmul(wr[$j], wi[$j], ys[$(2j + 1)], ys[$(2j + 2)])
+               yre[yb+$j*s+q] = or
+               yim[yb+$j*s+q] = oi
+           end for j in 1:M]
+    quote
+        $(Expr(:meta, :inline))
+        @inbounds begin
+            $(exs...)
         end
-    else
-        @inbounds for p in prange
-            Base.Cartesian.@nexprs 4 j -> begin
-                wr_j = twr[4p+j]; wi_j = twi[4p+j]
-            end
-            xb = s * p; yb = 5 * s * p
-            for q in qrange
-                Base.Cartesian.@nexprs 5 j -> begin
-                    xr_j = xre[xb+(j-1)*ms+q]
-                    xi_j = xim[xb+(j-1)*ms+q]
-                end
-                ys = bf5(xr_1, xi_1, xr_2, xi_2, xr_3, xi_3, xr_4, xi_4, xr_5, xi_5,
-                         c1, c2, s1, s2)
-                yre[yb+q] = ys[1]; yim[yb+q] = ys[2]
-                Base.Cartesian.@nexprs 4 j -> begin
-                    or_j, oi_j = cmul(wr_j, wi_j, ys[2j+1], ys[2j+2])
-                    yre[yb+j*s+q] = or_j; yim[yb+j*s+q] = oi_j
-                end
-            end
-        end
+        return nothing
     end
-    return nothing
 end
 
-bf7_consts(::Type{T}, D::Int) where {T} =
-    (ntuple(i -> T(cospi(2 * (((i - 1) % 3 + 1) * ((i - 1) ÷ 3 + 1)) / 7)), 9),
-     ntuple(i -> T(D * sinpi(2 * (((i - 1) % 3 + 1) * ((i - 1) ÷ 3 + 1)) / 7)), 9))
-
-function stage7!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D},
-                 prange::UnitRange{Int}=0:(n ÷ 7)-1,
-                 qrange::UnitRange{Int}=1:s) where {T,D}
-    m = n ÷ 7
+# Odd-prime stage (every odd radix): bfp butterflies with (P-1) twiddles per
+# butterfly. These run after the radix-4 tower, so s is large for all but
+# tiny n (scalar fallback otherwise).
+function stagep!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
+                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T},
+                 ::Val{P}, ::Val{D},
+                 prange::UnitRange{Int}=0:(n ÷ P)-1,
+                 qrange::UnitRange{Int}=1:s) where {T,P,D}
+    m = n ÷ P
     ms = m * s
-    cc, ss = bf7_consts(T, D)
+    cc, ss = bfp_consts(T, Val(P), Val(D))
     W = pick_width(T)
     if W > 1 && length(qrange) ≥ W
-        ccv = map(Vec{W,T}, cc); ssv = map(Vec{W,T}, ss)
+        ccv = vsplat(Vec{W,T}, cc)
+        ssv = vsplat(Vec{W,T}, ss)
         @inbounds for p in prange
-            Base.Cartesian.@nexprs 6 j -> begin
-                wr_j = Vec{W,T}(twr[6p+j]); wi_j = Vec{W,T}(twi[6p+j])
-            end
-            xb = s * p; yb = 7 * s * p
+            # @inbounds does not propagate into ntuple closures, so each body
+            # needs its own (bounds checks here cost ~20% at radix 5)
+            wr = ntuple(j -> Vec{W,T}(@inbounds twr[(P-1)*p+j]), Val(P - 1))
+            wi = ntuple(j -> Vec{W,T}(@inbounds twi[(P-1)*p+j]), Val(P - 1))
             for q in QWin(qrange, W)
-                Base.Cartesian.@nexprs 7 j -> begin
-                    xr_j = vload(Vec{W,T}, xre, xb + (j - 1) * ms + q)
-                    xi_j = vload(Vec{W,T}, xim, xb + (j - 1) * ms + q)
-                end
-                ys = bf7(xr_1, xi_1, xr_2, xi_2, xr_3, xi_3, xr_4, xi_4,
-                         xr_5, xi_5, xr_6, xi_6, xr_7, xi_7, ccv, ssv)
-                vstore(ys[1], yre, yb + q); vstore(ys[2], yim, yb + q)
-                Base.Cartesian.@nexprs 6 j -> begin
-                    or_j, oi_j = cmul(wr_j, wi_j, ys[2j+1], ys[2j+2])
-                    vstore(or_j, yre, yb + j * s + q); vstore(oi_j, yim, yb + j * s + q)
-                end
+                xsr = ntuple(j -> @inbounds(vload(Vec{W,T}, xre, s * p + (j - 1) * ms + q)), Val(P))
+                xsi = ntuple(j -> @inbounds(vload(Vec{W,T}, xim, s * p + (j - 1) * ms + q)), Val(P))
+                ys = bfp(xsr, xsi, ccv, ssv)
+                vstore(ys[1], yre, P * s * p + q)
+                vstore(ys[2], yim, P * s * p + q)
+                stagep_out!(yre, yim, ys, wr, wi, P * s * p, s, q)
             end
         end
     else
         @inbounds for p in prange
-            Base.Cartesian.@nexprs 6 j -> begin
-                wr_j = twr[6p+j]; wi_j = twi[6p+j]
-            end
-            xb = s * p; yb = 7 * s * p
+            wr = ntuple(j -> @inbounds(twr[(P-1)*p+j]), Val(P - 1))
+            wi = ntuple(j -> @inbounds(twi[(P-1)*p+j]), Val(P - 1))
             for q in qrange
-                Base.Cartesian.@nexprs 7 j -> begin
-                    xr_j = xre[xb+(j-1)*ms+q]
-                    xi_j = xim[xb+(j-1)*ms+q]
-                end
-                ys = bf7(xr_1, xi_1, xr_2, xi_2, xr_3, xi_3, xr_4, xi_4,
-                         xr_5, xi_5, xr_6, xi_6, xr_7, xi_7, cc, ss)
-                yre[yb+q] = ys[1]; yim[yb+q] = ys[2]
-                Base.Cartesian.@nexprs 6 j -> begin
-                    or_j, oi_j = cmul(wr_j, wi_j, ys[2j+1], ys[2j+2])
-                    yre[yb+j*s+q] = or_j; yim[yb+j*s+q] = oi_j
-                end
+                xsr = ntuple(j -> @inbounds(xre[s*p+(j-1)*ms+q]), Val(P))
+                xsi = ntuple(j -> @inbounds(xim[s*p+(j-1)*ms+q]), Val(P))
+                ys = bfp(xsr, xsi, cc, ss)
+                yre[P*s*p+q] = ys[1]
+                yim[P*s*p+q] = ys[2]
+                stagep_out!(yre, yim, ys, wr, wi, P * s * p, s, q)
             end
         end
     end

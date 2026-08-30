@@ -143,64 +143,88 @@ end
             e2r - t2r, e2i - t2i, e3r - t3r, e3i - t3i)
 end
 
-# Radix-3 DFT: X1/X2 = (a - t/2) ± i·k(b-c), t = b+c, k = D·√3/2 (direction
-# folded into k by the caller). nh is -1/2 in the working type.
-@inline function bf3(ar, ai, br, bi, cr, ci, k, nh)
-    tr = br + cr; ti = bi + ci
-    sr = k * (br - cr); si = k * (bi - ci)
-    ur = muladd(tr, nh, ar); ui = muladd(ti, nh, ai)
-    return (ar + tr, ai + ti, ur - si, ui + sr, ur + si, ui - sr)
+# Generic odd-prime DFT butterfly via conjugate-symmetric pairing, generated
+# for any odd prime P (serves every odd radix; measured equal to the
+# previously handwritten radix-3/5/7 kernels). With h = (P-1)/2
+# and t_j = x_j + x_{P-j}, d_j = x_j - x_{P-j}:
+#   X_0 = x_0 + Σ t_j
+#   X_k = u_k + i·v_k,  X_{P-k} = u_k - i·v_k        (bins in natural order)
+#   u_k = x_0 + Σ_j cos(2πjk/P)·t_j,   v_k = D·Σ_j sin(2πjk/P)·d_j
+# All coefficients are real (h² muladds per bank per plane), ~4× fewer real
+# multiplies than a naive complex O(P²) DFT.
+# cc/ss coefficient banks indexed (k-1)h + j. Generated so
+# the tuples are compile-time constants (a runtime-length ntuple would be
+# type-unstable and allocate on every stage call).
+@generated function bfp_consts(::Type{T}, ::Val{P}, ::Val{D}) where {T,P,D}
+    h = (P - 1) >> 1
+    cc = ntuple(i -> T(cospi(2 * (((i - 1) % h + 1) * ((i - 1) ÷ h + 1)) / P)), h * h)
+    ss = ntuple(i -> T(D * sinpi(2 * (((i - 1) % h + 1) * ((i - 1) ÷ h + 1)) / P)), h * h)
+    return :(($cc, $ss))
 end
 
-# Radix-5 DFT via symmetric pairing: c1/c2 = cos(2π/5), cos(4π/5);
-# s1/s2 = D·sin(2π/5), D·sin(4π/5).
-@inline function bf5(x0r, x0i, x1r, x1i, x2r, x2i, x3r, x3i, x4r, x4i,
-                     c1, c2, s1, s2)
-    t1r = x1r + x4r; t1i = x1i + x4i
-    t2r = x2r + x3r; t2i = x2i + x3i
-    t3r = x1r - x4r; t3i = x1i - x4i
-    t4r = x2r - x3r; t4i = x2i - x3i
-    y0r = x0r + (t1r + t2r); y0i = x0i + (t1i + t2i)
-    u1r = muladd(c1, t1r, muladd(c2, t2r, x0r))
-    u1i = muladd(c1, t1i, muladd(c2, t2i, x0i))
-    u2r = muladd(c2, t1r, muladd(c1, t2r, x0r))
-    u2i = muladd(c2, t1i, muladd(c1, t2i, x0i))
-    v1r = muladd(s1, t3r, s2 * t4r); v1i = muladd(s1, t3i, s2 * t4i)
-    v2r = muladd(s2, t3r, -(s1 * t4r)); v2i = muladd(s2, t3i, -(s1 * t4i))
-    return (y0r, y0i,
-            u1r - v1i, u1i + v1r,
-            u2r - v2i, u2i + v2r,
-            u2r + v2i, u2i - v2r,
-            u1r + v1i, u1i - v1r)
+# broadcast a scalar tuple to Vec lanes; generated because Base's tuple map
+# hits its 32-element inference limit at P = 13 (h² = 36) and allocates
+@generated function vsplat(::Type{Vec{W,T}}, t::NTuple{N,T}) where {W,T,N}
+    quote
+        $(Expr(:meta, :inline))
+        @inbounds $(Expr(:tuple, (:(Vec{W,T}(t[$i])) for i in 1:N)...))
+    end
 end
 
-# Radix-7 DFT via symmetric pairing: cc[3(k-1)+j] = cos(2πjk/7),
-# ss[3(k-1)+j] = D·sin(2πjk/7), for output pair k = 1..3 and input pair j = 1..3.
-@inline function bf7(x0r, x0i, x1r, x1i, x2r, x2i, x3r, x3i,
-                     x4r, x4i, x5r, x5i, x6r, x6i, cc, ss)
-    t1r = x1r + x6r; t1i = x1i + x6i; d1r = x1r - x6r; d1i = x1i - x6i
-    t2r = x2r + x5r; t2i = x2i + x5i; d2r = x2r - x5r; d2i = x2i - x5i
-    t3r = x3r + x4r; t3i = x3i + x4i; d3r = x3r - x4r; d3i = x3i - x4i
-    y0r = x0r + (t1r + t2r + t3r); y0i = x0i + (t1i + t2i + t3i)
-    u1r = muladd(cc[1], t1r, muladd(cc[2], t2r, muladd(cc[3], t3r, x0r)))
-    u1i = muladd(cc[1], t1i, muladd(cc[2], t2i, muladd(cc[3], t3i, x0i)))
-    u2r = muladd(cc[4], t1r, muladd(cc[5], t2r, muladd(cc[6], t3r, x0r)))
-    u2i = muladd(cc[4], t1i, muladd(cc[5], t2i, muladd(cc[6], t3i, x0i)))
-    u3r = muladd(cc[7], t1r, muladd(cc[8], t2r, muladd(cc[9], t3r, x0r)))
-    u3i = muladd(cc[7], t1i, muladd(cc[8], t2i, muladd(cc[9], t3i, x0i)))
-    v1r = muladd(ss[1], d1r, muladd(ss[2], d2r, ss[3] * d3r))
-    v1i = muladd(ss[1], d1i, muladd(ss[2], d2i, ss[3] * d3i))
-    v2r = muladd(ss[4], d1r, muladd(ss[5], d2r, ss[6] * d3r))
-    v2i = muladd(ss[4], d1i, muladd(ss[5], d2i, ss[6] * d3i))
-    v3r = muladd(ss[7], d1r, muladd(ss[8], d2r, ss[9] * d3r))
-    v3i = muladd(ss[7], d1i, muladd(ss[8], d2i, ss[9] * d3i))
-    return (y0r, y0i,
-            u1r - v1i, u1i + v1r,
-            u2r - v2i, u2i + v2r,
-            u3r - v3i, u3i + v3r,
-            u3r + v3i, u3i - v3r,
-            u2r + v2i, u2i - v2r,
-            u1r + v1i, u1i - v1r)
+@generated function bfp(xr::NTuple{P,V}, xi::NTuple{P,V},
+                        cc::NTuple{HH,S}, ss::NTuple{HH,S}) where {P,V,S,HH}
+    h = (P - 1) >> 1
+    @assert HH == h * h
+    body = Expr[]
+    tr = [Symbol(:t, j, :r) for j in 1:h]
+    ti = [Symbol(:t, j, :i) for j in 1:h]
+    dr = [Symbol(:d, j, :r) for j in 1:h]
+    di = [Symbol(:d, j, :i) for j in 1:h]
+    for j in 1:h
+        push!(body, :($(tr[j]) = xr[$(j + 1)] + xr[$(P + 1 - j)]),
+              :($(ti[j]) = xi[$(j + 1)] + xi[$(P + 1 - j)]),
+              :($(dr[j]) = xr[$(j + 1)] - xr[$(P + 1 - j)]),
+              :($(di[j]) = xi[$(j + 1)] - xi[$(P + 1 - j)]))
+    end
+    sumr, sumi = tr[1], ti[1]
+    for j in 2:h
+        sumr = :($sumr + $(tr[j]))
+        sumi = :($sumi + $(ti[j]))
+    end
+    push!(body, :(y0r = xr[1] + $sumr), :(y0i = xi[1] + $sumi))
+    for k in 1:h
+        er, ei = :(xr[1]), :(xi[1])
+        for j in h:-1:1
+            c = :(cc[$((k - 1) * h + j)])
+            er = :(muladd($c, $(tr[j]), $er))
+            ei = :(muladd($c, $(ti[j]), $ei))
+        end
+        s = :(ss[$((k - 1) * h + h)])
+        vr, vi = :($s * $(dr[h])), :($s * $(di[h]))
+        for j in h-1:-1:1
+            s = :(ss[$((k - 1) * h + j)])
+            vr = :(muladd($s, $(dr[j]), $vr))
+            vi = :(muladd($s, $(di[j]), $vi))
+        end
+        push!(body, :($(Symbol(:u, k, :r)) = $er), :($(Symbol(:u, k, :i)) = $ei),
+              :($(Symbol(:v, k, :r)) = $vr), :($(Symbol(:v, k, :i)) = $vi))
+    end
+    outs = Any[:y0r, :y0i]
+    for k in 1:h
+        push!(outs, :($(Symbol(:u, k, :r)) - $(Symbol(:v, k, :i))),
+              :($(Symbol(:u, k, :i)) + $(Symbol(:v, k, :r))))
+    end
+    for k in h:-1:1
+        push!(outs, :($(Symbol(:u, k, :r)) + $(Symbol(:v, k, :i))),
+              :($(Symbol(:u, k, :i)) - $(Symbol(:v, k, :r))))
+    end
+    quote
+        $(Expr(:meta, :inline))
+        @inbounds begin
+            $(body...)
+            tuple($(outs...))
+        end
+    end
 end
 
 # full butterfly: t1..t3 twiddled by w1..w3
