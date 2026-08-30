@@ -11,6 +11,9 @@ struct DimPass{T}
     stages::Vector{Stage{T}}   # empty when fallback is used
     bstages::Vector{Stage{T}}  # batched-transposed chain (dim 1 only; may be empty)
     fallback::Union{Nothing,BluesteinPlan{T,-1},BluesteinPlan{T,1}}
+    # serial clones of fallback for parallel pencil execution (share the cached
+    # chirp/ghat/stage chains, own scratch); empty when the pass is serial
+    fallbacks::Vector{Any}
 end
 
 struct NdPlan{T,D,N}
@@ -21,13 +24,16 @@ struct NdPlan{T,D,N}
     aim::Vector{T}
     bre::Vector{T}
     bim::Vector{T}
-    pbuf::Vector{Complex{T}}   # pencil gather buffers for non-smooth dims
-    pbuf2::Vector{Complex{T}}
+    pbufs::Vector{Vector{Complex{T}}}  # per-task pencil gather buffers for
+    pbufs2::Vector{Vector{Complex{T}}} # non-smooth dims ([1] is the serial one)
     fuse_in::Bool              # first pass's first stage reads interleaved input
     fuse_out::Bool             # last pass's final stage writes interleaved output
     dim1_batched::Bool         # dim 1 runs transposed with pencils as lanes
+    nt::Int                    # task count for execution (1 = serial, zero-alloc)
     scale::T
 end
+
+plan_nt(p::NdPlan) = p.nt
 
 # would a per-pencil chain of length n get the fast fused-edge 1-D treatment?
 function pencil_fused(::Type{T}, n::Int, stages::Vector{Stage{T}}) where {T}
@@ -42,10 +48,12 @@ end
 
 # dims before first_dim are pure batch (rfft reuses this for dims 2..N)
 function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
-                 first_dim::Int=1) where {T<:AbstractFloat,N}
+                 first_dim::Int=1,
+                 nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat,N}
     all(≥(1), dims) || throw(ArgumentError("dimensions must be positive (got $dims)"))
     len = prod(dims)
     W = pick_width(T)
+    nt = plan_tasks(len, nthreads)
     passes = DimPass{T}[]
     maxfb = 0
     for d in first_dim:N
@@ -62,10 +70,18 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
             else
                 Stage{T}[]
             end
-            push!(passes, DimPass{T}(nd, Bi, Bo, stages, bstages, nothing))
+            push!(passes, DimPass{T}(nd, Bi, Bo, stages, bstages, nothing, Any[]))
         else
+            # pencils ≥ nt run parallel on serial clones; fewer pencils run a
+            # serial loop over the primary plan (threaded internally)
+            fbs = Any[]
+            if nt > 1 && Bi * Bo ≥ nt
+                for _ in 1:nt
+                    push!(fbs, _bluestein(T, nd, D, one(T); nthreads=1))
+                end
+            end
             push!(passes, DimPass{T}(nd, Bi, Bo, Stage{T}[], Stage{T}[],
-                                     _bluestein(T, nd, D, one(T))))
+                                     _bluestein(T, nd, D, one(T); nthreads), fbs))
             maxfb = max(maxfb, nd)
         end
     end
@@ -94,30 +110,40 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
             fuse_in = false
         end
     end
+    npb = any(!isempty(p.fallbacks) for p in passes) ? nt : 1
     return NdPlan{T,D,N}(dims, len, passes,
                          Vector{T}(undef, len), Vector{T}(undef, len),
                          Vector{T}(undef, len), Vector{T}(undef, len),
-                         Vector{Complex{T}}(undef, maxfb),
-                         Vector{Complex{T}}(undef, maxfb),
-                         fuse_in, fuse_out, dim1_batched, scale)
+                         [Vector{Complex{T}}(undef, maxfb) for _ in 1:npb],
+                         [Vector{Complex{T}}(undef, maxfb) for _ in 1:npb],
+                         fuse_in, fuse_out, dim1_batched, nt, scale)
 end
 
 # transpose both planes from (cre,cim) into (ore,oim); returns the roles
 # swapped so the transposed data is the caller's new current plane
-function transpose_planes!(ore, oim, cre, cim, R::Int, C::Int)
-    transpose_plane!(ore, cre, R, C)
-    transpose_plane!(oim, cim, R, C)
+function transpose_planes!(ore, oim, cre, cim, R::Int, C::Int, nt::Int=1)
+    if nt > 1
+        W = pick_width(eltype(ore))
+        tforeach((lo, hi) -> (transpose_plane!(ore, cre, R, C, lo:hi);
+                              transpose_plane!(oim, cim, R, C, lo:hi)),
+                 C, nt; align=W)
+    else
+        transpose_plane!(ore, cre, R, C)
+        transpose_plane!(oim, cim, R, C)
+    end
     return ore, oim, cre, cim
 end
 
-# per-pencil gather -> 1-D plan -> scatter, in place at the split-plane level
-function _fallback_pass!(cre::Vector{T}, cim::Vector{T}, pass::DimPass{T},
-                         buf::Vector{Complex{T}}, buf2::Vector{Complex{T}}) where {T}
+# pencils trange (1-based) of one fallback pass: gather -> 1-D plan -> scatter,
+# in place at the split-plane level
+function _fallback_range!(cre::Vector{T}, cim::Vector{T}, pass::DimPass{T}, fb,
+                          buf::Vector{Complex{T}}, buf2::Vector{Complex{T}},
+                          tlo::Int, thi::Int) where {T}
     nd, Bi = pass.nd, pass.Bi
-    fb = pass.fallback
     bv = view(buf, 1:nd)
     bv2 = view(buf2, 1:nd)
-    @inbounds for o in 0:pass.Bo-1, i in 0:Bi-1
+    @inbounds for t in tlo-1:thi-1
+        o, i = divrem(t, Bi)
         base = o * Bi * nd + i + 1
         for k in 0:nd-1
             bv[k+1] = Complex(cre[base+Bi*k], cim[base+Bi*k])
@@ -128,6 +154,26 @@ function _fallback_pass!(cre::Vector{T}, cim::Vector{T}, pass::DimPass{T},
             cre[base+Bi*k] = real(z)
             cim[base+Bi*k] = imag(z)
         end
+    end
+    return nothing
+end
+
+# per-pencil fallback pass: parallel over pencils when there are enough of
+# them (each chunk on its own serial clone + scratch), else a serial loop over
+# the primary plan, which threads its own inner transforms
+function _fallback_pass!(cre::Vector{T}, cim::Vector{T}, pass::DimPass{T},
+                         pbufs::Vector{Vector{Complex{T}}},
+                         pbufs2::Vector{Vector{Complex{T}}}, nt::Int) where {T}
+    total = pass.Bo * pass.Bi
+    if nt > 1 && !isempty(pass.fallbacks) && total ≥ nt
+        tforeach_chunks((ci, lo, hi) -> _fallback_range!(cre, cim, pass,
+                                                         pass.fallbacks[ci],
+                                                         pbufs[ci], pbufs2[ci],
+                                                         lo, hi),
+                        total, nt)
+    else
+        _fallback_range!(cre, cim, pass, pass.fallback, pbufs[1], pbufs2[1],
+                         1, total)
     end
     return nothing
 end
@@ -151,42 +197,81 @@ function _exec_nd!(p::NdPlan{T,D,N}, y::AbstractArray{Complex{T}},
     return y
 end
 
+# fused-input blocks olo:ohi (1-based); nt > 1 threads within each block
+# (used when there are too few blocks to parallelize over)
+function _fusein_blocks!(cre::Vector{T}, cim::Vector{T}, px::Ptr{T},
+                         pass::DimPass{T}, st1::Stage{T}, d::Val,
+                         olo::Int, ohi::Int, nt::Int) where {T}
+    sz = sizeof(T)
+    block = pass.Bi * pass.nd
+    W = pick_width(T)
+    @inbounds for o in olo-1:ohi-1
+        off = o * block
+        yr = view(cre, off+1:off+block)
+        yi = view(cim, off+1:off+block)
+        pb = px + sz * 2off
+        if pass.Bi == 1
+            if nt > 1
+                let yr = yr, yi = yi, pb = pb
+                    tforeach((lo, hi) -> stage4_first!(yr, yi, pb, pass.nd,
+                                                       st1.twr, st1.twi, d, lo:hi),
+                             pass.nd >>> 2, nt; align=W)
+                end
+            else
+                stage4_first!(yr, yi, pb, pass.nd, st1.twr, st1.twi, d)
+            end
+        else
+            if nt > 1
+                let yr = yr, yi = yi, pb = pb
+                    tforeach((lo, hi) -> stage4_ilvin!(yr, yi, pb, pass.nd,
+                                                       pass.Bi, st1.twr, st1.twi,
+                                                       d, (lo - 1):(hi - 1)),
+                             pass.nd >>> 2, nt)
+                end
+            else
+                stage4_ilvin!(yr, yi, pb, pass.nd, pass.Bi, st1.twr, st1.twi, d)
+            end
+        end
+    end
+    return nothing
+end
+
 # input side: convert x into split planes (or consume the first stage doing
 # so); returns the current/other plane roles and the first pass's start stage
 function _nd_input!(p::NdPlan{T,D,N}, x, px::Ptr{T}) where {T,D,N}
-    sz = sizeof(T)
     cre, cim, ore, oim = p.are, p.aim, p.bre, p.bim
+    nt = p.nt
     stagestart = 1
     @inbounds begin
         if p.dim1_batched
             # dim 1 transposed: pencils become vector lanes, the chain runs as
-            # plain wide strided stages, then transpose back
-            pass1 = p.passes[1]
-            n1, B = pass1.nd, pass1.Bo
-            deinterleave_all!(cre, cim, x)
-            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, n1, B)
+            # plain wide strided stages, then transpose back. (Named passb, not
+            # pass1: sharing a name with the fuse_in branch's closure-captured
+            # local would box it and allocate on every call.)
+            passb = p.passes[1]
+            n1, B = passb.nd, passb.Bo
+            deinterleave_all!(cre, cim, x, nt)
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, n1, B, nt)
             cre, cim, ore, oim =
-                run_chain!(cre, cim, ore, oim, pass1.bstages, n1, 1, B, Val(D))
-            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, B, n1)
+                run_chain!(cre, cim, ore, oim, passb.bstages, n1, 1, B, Val(D), nt)
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, B, n1, nt)
         elseif p.fuse_in
             pass1 = p.passes[1]
             st1 = pass1.stages[1]
-            block = pass1.Bi * pass1.nd
-            for o in 0:pass1.Bo-1
-                off = o * block
-                yr = view(cre, off+1:off+block)
-                yi = view(cim, off+1:off+block)
-                if pass1.Bi == 1
-                    stage4_first!(yr, yi, px + sz * 2off, pass1.nd,
-                                  st1.twr, st1.twi, Val(D))
-                else
-                    stage4_ilvin!(yr, yi, px + sz * 2off, pass1.nd, pass1.Bi,
-                                  st1.twr, st1.twi, Val(D))
+            if nt > 1 && pass1.Bo ≥ nt
+                # cre/cim are reassigned in the branch above; capture
+                # let-bound copies so the closure doesn't box them
+                let cr = cre, ci = cim
+                    tforeach((lo, hi) -> _fusein_blocks!(cr, ci, px, pass1, st1,
+                                                         Val(D), lo, hi, 1),
+                             pass1.Bo, nt)
                 end
+            else
+                _fusein_blocks!(cre, cim, px, pass1, st1, Val(D), 1, pass1.Bo, nt)
             end
             stagestart = 2
         else
-            deinterleave_all!(cre, cim, x)
+            deinterleave_all!(cre, cim, x, nt)
         end
     end
     return cre, cim, ore, oim, stagestart
@@ -195,14 +280,28 @@ end
 # the strided pass chain, plus (when emit) the fused/converted output. When
 # emit=false the plan's reserved fuse_out stage still runs as a plain stage
 # and no output conversion happens; returns the final plane roles.
+# blocks olo:ohi (1-based) of one strided pass; nt > 1 threads within each
+# block's chain (used when there are too few blocks to parallelize over)
+function _pass_blocks!(cre, cim, ore, oim, chain, ncur0::Int, s0::Int, Bi::Int,
+                       block::Int, olo::Int, ohi::Int, d::Val, nt::Int)
+    @inbounds for o in olo-1:ohi-1
+        rng = o*block+1:(o+1)*block
+        run_chain!(view(cre, rng), view(cim, rng),
+                   view(ore, rng), view(oim, rng),
+                   chain, ncur0, s0, Bi, d, nt)
+    end
+    return nothing
+end
+
 function _nd_core!(p::NdPlan{T,D,N}, y, py::Ptr{T}, cre, cim, ore, oim,
                    stagestart::Int, skip1::Bool, emit::Bool) where {T,D,N}
     np = length(p.passes)
+    nt = p.nt
     @inbounds begin
         for (pi, pass) in enumerate(p.passes)
             pi == 1 && skip1 && continue
             if pass.fallback !== nothing
-                _fallback_pass!(cre, cim, pass, p.pbuf, p.pbuf2)
+                _fallback_pass!(cre, cim, pass, p.pbufs, p.pbufs2, nt)
                 continue
             end
             from = pi == 1 ? stagestart : 1
@@ -217,11 +316,22 @@ function _nd_core!(p::NdPlan{T,D,N}, y, py::Ptr{T}, cre, cim, ore, oim,
             end
             block = pass.Bi * pass.nd
             chain = view(pass.stages, from:to)
-            for o in 0:pass.Bo-1
-                rng = o*block+1:(o+1)*block
-                run_chain!(view(cre, rng), view(cim, rng),
-                           view(ore, rng), view(oim, rng),
-                           chain, ncur0, s0, pass.Bi, Val(D))
+            if nt > 1 && pass.Bo ≥ nt
+                # enough independent blocks: parallelize over them, chains
+                # serial inside. cre/... are reassigned below, so capture
+                # let-bound copies to avoid boxing them.
+                let cr = cre, ci = cim, or = ore, oi = oim, chain = chain,
+                    ncur0 = ncur0, s0 = s0, Bi = pass.Bi, block = block
+                    tforeach((lo, hi) -> _pass_blocks!(cr, ci, or, oi, chain,
+                                                       ncur0, s0, Bi, block,
+                                                       lo, hi, Val(D), 1),
+                             pass.Bo, nt)
+                end
+            else
+                # few blocks (e.g. the last dim, Bo == 1): thread inside the
+                # chains instead
+                _pass_blocks!(cre, cim, ore, oim, chain, ncur0, s0, pass.Bi,
+                              block, 1, pass.Bo, Val(D), nt)
             end
             if isodd(to - from + 1)
                 cre, ore = ore, cre
@@ -233,9 +343,9 @@ function _nd_core!(p::NdPlan{T,D,N}, y, py::Ptr{T}, cre, cim, ore, oim,
                 pl = p.passes[end]
                 f = pl.stages[end].radix
                 run_last_stage!(py, cre, cim, pl.Bi * (pl.nd ÷ f), f, p.scale,
-                                Val(D))
+                                Val(D), nt)
             else
-                interleave_all!(y, cre, cim, p.scale)
+                interleave_all!(y, cre, cim, p.scale, nt)
             end
         end
     end
@@ -273,23 +383,36 @@ struct RfftNdPlan{T,N,R}
     cdims::NTuple{N,Int}
     B::Int                     # batch = prod(dims[2:N])
     r1::R                      # 1-D rfft plan for n1 (twiddle source when batched)
+    r1s::Vector{R}             # serial clones for parallel pencils (may be empty)
     C::Vector{Complex{T}}      # per-pencil intermediate (empty when batched)
     rest::NdPlan{T,-1,N}       # dims 2..N, dim 1 as batch
     batched::Bool
     bstages::Vector{Stage{T}}  # forward chain for h = n1>>1, batched layout
 end
 
-function _ndrfft(::Type{T}, dims::NTuple{N,Int}) where {T<:AbstractFloat,N}
+plan_nt(p::RfftNdPlan) = p.rest.nt
+
+function _ndrfft(::Type{T}, dims::NTuple{N,Int};
+                 nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat,N}
     n1 = dims[1]
     cdims = (n1 ÷ 2 + 1, dims[2:N]...)
     B = prod(dims[2:N])
     batched = _real_batched(T, n1, B)
     bstages = batched ? first(build_stages_cached(T, n1 >>> 1, -1; allow_small=false)) :
               Stage{T}[]
-    return RfftNdPlan{T,N,typeof(plan_rfft(T, n1))}(
-        dims, cdims, B, plan_rfft(T, n1),
+    rest = _ndplan(T, cdims, -1, one(T); first_dim=2, nthreads)
+    r1 = plan_rfft(T, n1; nthreads)
+    R = typeof(r1)
+    r1s = R[]
+    if !batched && rest.nt > 1 && B ≥ rest.nt
+        for _ in 1:rest.nt
+            push!(r1s, plan_rfft(T, n1; nthreads=1))
+        end
+    end
+    return RfftNdPlan{T,N,R}(
+        dims, cdims, B, r1, r1s,
         Vector{Complex{T}}(undef, batched ? 0 : prod(cdims)),
-        _ndplan(T, cdims, -1, one(T); first_dim=2), batched, bstages)
+        rest, batched, bstages)
 end
 
 function (p::RfftNdPlan{T,N})(Y::Array{Complex{T},N}, X::Array{T,N}) where {T,N}
@@ -299,6 +422,7 @@ function (p::RfftNdPlan{T,N})(Y::Array{Complex{T},N}, X::Array{T,N}) where {T,N}
     h1p = p.cdims[1]
     B = p.B
     r = p.rest
+    nt = r.nt
     if p.batched
         # dim-1 real edge entirely in split planes, pencils as lanes: batched
         # half-length transform, across-pencil split/merge, transpose into the
@@ -306,22 +430,35 @@ function (p::RfftNdPlan{T,N})(Y::Array{Complex{T},N}, X::Array{T,N}) where {T,N}
         h = n1 >>> 1
         cre, cim, ore, oim = r.are, r.aim, r.bre, r.bim
         GC.@preserve X Y begin
-            deinterleave_all!(cre, cim, reinterpret(Complex{T}, X))
-            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, h, B)
+            deinterleave_all!(cre, cim, reinterpret(Complex{T}, X), nt)
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, h, B, nt)
             cre, cim, ore, oim =
-                run_chain!(cre, cim, ore, oim, p.bstages, h, 1, B, Val(-1))
-            rfft_post_batched!(ore, oim, cre, cim, B, h, p.r1.twr, p.r1.twi)
-            cre, cim, ore, oim = transpose_planes!(cre, cim, ore, oim, B, h1p)
+                run_chain!(cre, cim, ore, oim, p.bstages, h, 1, B, Val(-1), nt)
+            rfft_post_batched!(ore, oim, cre, cim, B, h, p.r1.twr, p.r1.twi, nt)
+            cre, cim, ore, oim = transpose_planes!(cre, cim, ore, oim, B, h1p, nt)
             _nd_core!(r, Y, _rawptr(Y), cre, cim, ore, oim, 1, false, true)
         end
     else
         C = p.C
-        for o in 0:B-1
-            p.r1(view(C, o*h1p+1:(o+1)*h1p), view(X, o*n1+1:(o+1)*n1))
+        if nt > 1 && !isempty(p.r1s)
+            tforeach_chunks((ci, olo, ohi) -> _real_pencils!(p.r1s[ci], C, X,
+                                                             h1p, n1, olo, ohi),
+                            B, nt)
+        else
+            _real_pencils!(p.r1, C, X, h1p, n1, 1, B)
         end
         _exec_nd!(r, Y, C)
     end
     return Y
+end
+
+# real-edge pencils olo:ohi (1-based): src rows of srows → dst rows of drows
+# through the 1-D plan r1 (rfft or irfft direction)
+function _real_pencils!(r1, dst, src, drows::Int, srows::Int, olo::Int, ohi::Int)
+    for o in olo-1:ohi-1
+        r1(view(dst, o*drows+1:(o+1)*drows), view(src, o*srows+1:(o+1)*srows))
+    end
+    return nothing
 end
 (p::RfftNdPlan{T,N})(X::Array{T,N}) where {T,N} =
     p(Array{Complex{T},N}(undef, p.cdims), X)
@@ -333,28 +470,39 @@ struct IrfftNdPlan{T,N,R}
     rest::NdPlan{T,1,N}      # dims 2..N backward, dim 1 as batch
     C::Vector{Complex{T}}    # per-pencil intermediate (empty when batched)
     r1::R                    # 1-D irfft (normalized) or brfft plan for n1
+    r1s::Vector{R}           # serial clones for parallel pencils (may be empty)
     batched::Bool
     bstages::Vector{Stage{T}}  # backward chain for h = n1>>1, batched layout
     bpre::T                  # pre-pass factor with all normalization folded in
 end
 
-function _ndirfft(::Type{T}, dims::NTuple{N,Int}; normalized::Bool) where {T<:AbstractFloat,N}
+plan_nt(p::IrfftNdPlan) = p.rest.nt
+
+function _ndirfft(::Type{T}, dims::NTuple{N,Int}; normalized::Bool,
+                  nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat,N}
     n1 = dims[1]
     h = n1 >>> 1
     cdims = (n1 ÷ 2 + 1, dims[2:N]...)
     B = prod(dims[2:N])
     restscale = normalized ? one(T) / B : one(T)
-    r1 = plan_irfft(T, n1; normalized)
+    r1 = plan_irfft(T, n1; normalized, nthreads)
     batched = _real_batched(T, n1, B)
     bstages = batched ? first(build_stages_cached(T, h, +1; allow_small=false)) : Stage{T}[]
     # batched path skips both the rest chain's output scale and the 1-D inner
     # normalization, so fold everything into the pre-pass factor:
     # irfft total = 1/(n1·prod(dims[2:N])) = (1/2)·(1/h)·restscale
     bpre = normalized ? restscale / n1 : one(T)
-    return IrfftNdPlan{T,N,typeof(r1)}(
-        dims, cdims, B,
-        _ndplan(T, cdims, +1, restscale; first_dim=2),
-        Vector{Complex{T}}(undef, batched ? 0 : prod(cdims)), r1,
+    rest = _ndplan(T, cdims, +1, restscale; first_dim=2, nthreads)
+    R = typeof(r1)
+    r1s = R[]
+    if !batched && rest.nt > 1 && B ≥ rest.nt
+        for _ in 1:rest.nt
+            push!(r1s, plan_irfft(T, n1; normalized, nthreads=1))
+        end
+    end
+    return IrfftNdPlan{T,N,R}(
+        dims, cdims, B, rest,
+        Vector{Complex{T}}(undef, batched ? 0 : prod(cdims)), r1, r1s,
         batched, bstages, bpre)
 end
 
@@ -365,6 +513,7 @@ function (p::IrfftNdPlan{T,N})(y::Array{T,N}, X::Array{Complex{T},N}) where {T,N
     h1p = p.cdims[1]
     B = p.B
     r = p.rest
+    nt = r.nt
     if p.batched
         h = n1 >>> 1
         GC.@preserve X y begin
@@ -373,18 +522,23 @@ function (p::IrfftNdPlan{T,N})(y::Array{T,N}, X::Array{Complex{T},N}) where {T,N
             cre, cim, ore, oim =
                 _nd_core!(r, X, px, cre, cim, ore, oim, stagestart,
                           r.dim1_batched, false)
-            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, h1p, B)
-            irfft_pre_batched!(ore, oim, cre, cim, B, h, p.r1.twr, p.r1.twi, p.bpre)
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, h1p, B, nt)
+            irfft_pre_batched!(ore, oim, cre, cim, B, h, p.r1.twr, p.r1.twi,
+                               p.bpre, nt)
             cre, cim, ore, oim =
-                run_chain!(ore, oim, cre, cim, p.bstages, h, 1, B, Val(1))
-            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, B, h)
-            interleave_all!(reinterpret(Complex{T}, y), cre, cim, one(T))
+                run_chain!(ore, oim, cre, cim, p.bstages, h, 1, B, Val(1), nt)
+            cre, cim, ore, oim = transpose_planes!(ore, oim, cre, cim, B, h, nt)
+            interleave_all!(reinterpret(Complex{T}, y), cre, cim, one(T), nt)
         end
     else
         _exec_nd!(r, p.C, X)
         C = p.C
-        for o in 0:B-1
-            p.r1(view(y, o*n1+1:(o+1)*n1), view(C, o*h1p+1:(o+1)*h1p))
+        if nt > 1 && !isempty(p.r1s)
+            tforeach_chunks((ci, olo, ohi) -> _real_pencils!(p.r1s[ci], y, C,
+                                                             n1, h1p, olo, ohi),
+                            B, nt)
+        else
+            _real_pencils!(p.r1, y, C, n1, h1p, 1, B)
         end
     end
     return y

@@ -4,33 +4,40 @@
 # interleaved sub-transforms (butterfly stride); s*n == total length at every
 # stage. Twiddles are precomputed in access order (radix-1 per butterfly).
 
-# W-wide windows covering 1:s; when W ∤ s the last window overlaps the previous
-# one, which is safe: within a butterfly p, lanes are independent and recomputed
-# lanes store identical values. Requires s ≥ W.
+# W-wide windows covering lo:hi; when W ∤ length the last window overlaps the
+# previous one, which is safe: within a butterfly p, lanes are independent and
+# recomputed lanes store identical values. Requires hi - lo + 1 ≥ W. Parallel
+# chunks of a q-range are W-aligned and ≥ W long (tforeach align), so the
+# overlap never crosses a chunk boundary.
 struct QWin
-    s::Int
+    lo::Int
+    hi::Int
     W::Int
 end
-@inline function Base.iterate(qw::QWin, q::Int=1)
-    q > qw.s && return nothing
-    q + qw.W - 1 ≤ qw.s ? (q, q + qw.W) : (qw.s - qw.W + 1, qw.s + 1)
+QWin(s::Int, W::Int) = QWin(1, s, W)
+QWin(r::UnitRange{Int}, W::Int) = QWin(first(r), last(r), W)
+@inline function Base.iterate(qw::QWin, q::Int=qw.lo)
+    q > qw.hi && return nothing
+    q + qw.W - 1 ≤ qw.hi ? (q, q + qw.W) : (qw.hi - qw.W + 1, qw.hi + 1)
 end
 Base.IteratorSize(::Type{QWin}) = Base.SizeUnknown()
 Base.eltype(::Type{QWin}) = Int
 
 function stage4!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, d::Val{D}) where {T,D}
+                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, d::Val{D},
+                 prange::UnitRange{Int}=0:(n >>> 2)-1,
+                 qrange::UnitRange{Int}=1:s) where {T,D}
     m = n >>> 2
     ms = m * s
     W = pick_width(T)
-    if W > 1 && s ≥ W
-        @inbounds for p in 0:m-1
+    if W > 1 && length(qrange) ≥ W
+        @inbounds for p in prange
             w1r = Vec{W,T}(twr[3p+1]); w1i = Vec{W,T}(twi[3p+1])
             w2r = Vec{W,T}(twr[3p+2]); w2i = Vec{W,T}(twi[3p+2])
             w3r = Vec{W,T}(twr[3p+3]); w3i = Vec{W,T}(twi[3p+3])
             xb = s * p
             yb = 4 * s * p
-            for q in QWin(s, W)
+            for q in QWin(qrange, W)
                 ar = vload(Vec{W,T}, xre, xb + q);        ai = vload(Vec{W,T}, xim, xb + q)
                 br = vload(Vec{W,T}, xre, xb + ms + q);   bi = vload(Vec{W,T}, xim, xb + ms + q)
                 cr = vload(Vec{W,T}, xre, xb + 2ms + q);  ci = vload(Vec{W,T}, xim, xb + 2ms + q)
@@ -45,13 +52,13 @@ function stage4!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::Plan
             end
         end
     else
-        @inbounds for p in 0:m-1
+        @inbounds for p in prange
             w1r = twr[3p+1]; w1i = twi[3p+1]
             w2r = twr[3p+2]; w2i = twi[3p+2]
             w3r = twr[3p+3]; w3i = twi[3p+3]
             xb = s * p
             yb = 4 * s * p
-            for q in 1:s
+            for q in qrange
                 y0r, y0i, y1r, y1i, y2r, y2i, y3r, y3i =
                     bf4(xre[xb+q], xim[xb+q],
                         xre[xb+ms+q], xim[xb+ms+q],
@@ -74,11 +81,11 @@ end
 # per lane: twr/twi hold w1, w2, w3 each over the m*s flat indices.
 function stage4_small!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
                        n::Int, ::Val{S}, twr::Vector{T}, twi::Vector{T},
-                       d::Val{D}) where {T,S,D}
+                       d::Val{D}, frange::UnitRange{Int}=1:(n >>> 2)*S) where {T,S,D}
     W = pick_width(T)
     m = n >>> 2
     ms = m * S
-    @inbounds for f in 1:W:ms
+    @inbounds for f in first(frange):W:last(frange)
         ar = vload(Vec{W,T}, xre, f);         ai = vload(Vec{W,T}, xim, f)
         br = vload(Vec{W,T}, xre, ms + f);    bi = vload(Vec{W,T}, xim, ms + f)
         cr = vload(Vec{W,T}, xre, 2ms + f);   ci = vload(Vec{W,T}, xim, 2ms + f)
@@ -104,11 +111,12 @@ end
 # input: two vector loads + a deinterleave shuffle replace the copy pass.
 # Twiddles use the expanded small-stage layout.
 function stage4_first!(yre::PlaneVec{T}, yim::PlaneVec{T}, px::Ptr{T}, n::Int,
-                       twr::Vector{T}, twi::Vector{T}, d::Val{D}) where {T,D}
+                       twr::Vector{T}, twi::Vector{T}, d::Val{D},
+                       frange::UnitRange{Int}=1:n >>> 2) where {T,D}
     W = pick_width(T)
     m = n >>> 2
     sz = sizeof(T)
-    @inbounds for f in 1:W:m
+    @inbounds for f in first(frange):W:last(frange)
         b0 = 2 * (f - 1)
         u = vload(Vec{W,T}, px + sz * b0);            v = vload(Vec{W,T}, px + sz * (b0 + W))
         ar, ai = deinterleave2(u, v)
@@ -138,11 +146,12 @@ end
 # Last stage (m == 1, so twiddle-free) writing scaled interleaved complex
 # output directly: butterfly, scale, re/im interleave shuffle, store.
 function stage4_last!(py::Ptr{T}, xre::PlaneVec{T}, xim::PlaneVec{T}, s::Int,
-                      scale::T, d::Val{D}) where {T,D}
+                      scale::T, d::Val{D},
+                      qrange::UnitRange{Int}=1:s) where {T,D}
     W = pick_width(T)
     sc = Vec{W,T}(scale)
     sz = sizeof(T)
-    @inbounds for q in QWin(s, W)
+    @inbounds for q in QWin(qrange, W)
         ar = vload(Vec{W,T}, xre, q);       ai = vload(Vec{W,T}, xim, q)
         br = vload(Vec{W,T}, xre, s + q);   bi = vload(Vec{W,T}, xim, s + q)
         cr = vload(Vec{W,T}, xre, 2s + q);  ci = vload(Vec{W,T}, xim, 2s + q)
@@ -164,12 +173,13 @@ end
 # Radix-8 final stage (m == 1, twiddle-free), fused interleaved output. Used
 # for odd log2 n so the extra radix-2 pass disappears.
 function stage8_last!(py::Ptr{T}, xre::PlaneVec{T}, xim::PlaneVec{T}, s::Int,
-                      scale::T, d::Val{D}) where {T,D}
+                      scale::T, d::Val{D},
+                      qrange::UnitRange{Int}=1:s) where {T,D}
     W = pick_width(T)
     sc = Vec{W,T}(scale)
     c = Vec{W,T}(T(sqrt(0.5)))
     sz = sizeof(T)
-    @inbounds for q in QWin(s, W)
+    @inbounds for q in QWin(qrange, W)
         x0r = vload(Vec{W,T}, xre, q);       x0i = vload(Vec{W,T}, xim, q)
         x1r = vload(Vec{W,T}, xre, s + q);   x1i = vload(Vec{W,T}, xim, s + q)
         x2r = vload(Vec{W,T}, xre, 2s + q);  x2i = vload(Vec{W,T}, xim, 2s + q)
@@ -192,11 +202,12 @@ end
 # Radix-8 final stage writing split planes (unfused fallback); butterfly
 # partners at stride s, outputs land at the same offsets.
 function stage8_plain!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                       s::Int, d::Val{D}) where {T,D}
+                       s::Int, d::Val{D},
+                       qrange::UnitRange{Int}=1:s) where {T,D}
     W = pick_width(T)
-    if W > 1 && s ≥ W
+    if W > 1 && length(qrange) ≥ W
         c = Vec{W,T}(T(sqrt(0.5)))
-        @inbounds for q in QWin(s, W)
+        @inbounds for q in QWin(qrange, W)
             Base.Cartesian.@nexprs 8 j -> begin
                 xr_j = vload(Vec{W,T}, xre, (j - 1) * s + q)
                 xi_j = vload(Vec{W,T}, xim, (j - 1) * s + q)
@@ -210,7 +221,7 @@ function stage8_plain!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim
         end
     else
         c = T(sqrt(0.5))
-        @inbounds for q in 1:s
+        @inbounds for q in qrange
             Base.Cartesian.@nexprs 8 j -> begin
                 xr_j = xre[(j-1)*s+q]
                 xi_j = xim[(j-1)*s+q]
@@ -228,11 +239,11 @@ end
 
 # radix-2 variant of the fused last stage (odd log2 n)
 function stage2_last!(py::Ptr{T}, xre::PlaneVec{T}, xim::PlaneVec{T}, s::Int,
-                      scale::T) where {T}
+                      scale::T, qrange::UnitRange{Int}=1:s) where {T}
     W = pick_width(T)
     sc = Vec{W,T}(scale)
     sz = sizeof(T)
-    @inbounds for q in QWin(s, W)
+    @inbounds for q in QWin(qrange, W)
         ar = vload(Vec{W,T}, xre, q);      ai = vload(Vec{W,T}, xim, q)
         br = vload(Vec{W,T}, xre, s + q);  bi = vload(Vec{W,T}, xim, s + q)
         lo, hi = interleave_chunks((ar + br) * sc, (ai + bi) * sc, Val(1))
@@ -246,19 +257,21 @@ end
 # Odd-radix stages. These run after the radix-4 tower, so s is large for all
 # but tiny n (scalar fallback otherwise).
 function stage3!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D}) where {T,D}
+                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D},
+                 prange::UnitRange{Int}=0:(n ÷ 3)-1,
+                 qrange::UnitRange{Int}=1:s) where {T,D}
     m = n ÷ 3
     ms = m * s
     k = T(D * sqrt(0.75))
     nh = T(-0.5)
     W = pick_width(T)
-    if W > 1 && s ≥ W
+    if W > 1 && length(qrange) ≥ W
         kv = Vec{W,T}(k); nhv = Vec{W,T}(nh)
-        @inbounds for p in 0:m-1
+        @inbounds for p in prange
             w1r = Vec{W,T}(twr[2p+1]); w1i = Vec{W,T}(twi[2p+1])
             w2r = Vec{W,T}(twr[2p+2]); w2i = Vec{W,T}(twi[2p+2])
             xb = s * p; yb = 3 * s * p
-            for q in QWin(s, W)
+            for q in QWin(qrange, W)
                 ys = bf3(vload(Vec{W,T}, xre, xb + q), vload(Vec{W,T}, xim, xb + q),
                          vload(Vec{W,T}, xre, xb + ms + q), vload(Vec{W,T}, xim, xb + ms + q),
                          vload(Vec{W,T}, xre, xb + 2ms + q), vload(Vec{W,T}, xim, xb + 2ms + q),
@@ -271,11 +284,11 @@ function stage3!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::Plan
             end
         end
     else
-        @inbounds for p in 0:m-1
+        @inbounds for p in prange
             w1r = twr[2p+1]; w1i = twi[2p+1]
             w2r = twr[2p+2]; w2i = twi[2p+2]
             xb = s * p; yb = 3 * s * p
-            for q in 1:s
+            for q in qrange
                 ys = bf3(xre[xb+q], xim[xb+q], xre[xb+ms+q], xim[xb+ms+q],
                          xre[xb+2ms+q], xim[xb+2ms+q], k, nh)
                 yre[yb+q] = ys[1]; yim[yb+q] = ys[2]
@@ -290,20 +303,22 @@ function stage3!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::Plan
 end
 
 function stage5!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D}) where {T,D}
+                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D},
+                 prange::UnitRange{Int}=0:(n ÷ 5)-1,
+                 qrange::UnitRange{Int}=1:s) where {T,D}
     m = n ÷ 5
     ms = m * s
     c1 = T(cospi(0.4)); c2 = T(cospi(0.8))
     s1 = T(D * sinpi(0.4)); s2 = T(D * sinpi(0.8))
     W = pick_width(T)
-    if W > 1 && s ≥ W
+    if W > 1 && length(qrange) ≥ W
         c1v = Vec{W,T}(c1); c2v = Vec{W,T}(c2); s1v = Vec{W,T}(s1); s2v = Vec{W,T}(s2)
-        @inbounds for p in 0:m-1
+        @inbounds for p in prange
             Base.Cartesian.@nexprs 4 j -> begin
                 wr_j = Vec{W,T}(twr[4p+j]); wi_j = Vec{W,T}(twi[4p+j])
             end
             xb = s * p; yb = 5 * s * p
-            for q in QWin(s, W)
+            for q in QWin(qrange, W)
                 Base.Cartesian.@nexprs 5 j -> begin
                     xr_j = vload(Vec{W,T}, xre, xb + (j - 1) * ms + q)
                     xi_j = vload(Vec{W,T}, xim, xb + (j - 1) * ms + q)
@@ -318,12 +333,12 @@ function stage5!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::Plan
             end
         end
     else
-        @inbounds for p in 0:m-1
+        @inbounds for p in prange
             Base.Cartesian.@nexprs 4 j -> begin
                 wr_j = twr[4p+j]; wi_j = twi[4p+j]
             end
             xb = s * p; yb = 5 * s * p
-            for q in 1:s
+            for q in qrange
                 Base.Cartesian.@nexprs 5 j -> begin
                     xr_j = xre[xb+(j-1)*ms+q]
                     xi_j = xim[xb+(j-1)*ms+q]
@@ -346,19 +361,21 @@ bf7_consts(::Type{T}, D::Int) where {T} =
      ntuple(i -> T(D * sinpi(2 * (((i - 1) % 3 + 1) * ((i - 1) ÷ 3 + 1)) / 7)), 9))
 
 function stage7!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D}) where {T,D}
+                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, ::Val{D},
+                 prange::UnitRange{Int}=0:(n ÷ 7)-1,
+                 qrange::UnitRange{Int}=1:s) where {T,D}
     m = n ÷ 7
     ms = m * s
     cc, ss = bf7_consts(T, D)
     W = pick_width(T)
-    if W > 1 && s ≥ W
+    if W > 1 && length(qrange) ≥ W
         ccv = map(Vec{W,T}, cc); ssv = map(Vec{W,T}, ss)
-        @inbounds for p in 0:m-1
+        @inbounds for p in prange
             Base.Cartesian.@nexprs 6 j -> begin
                 wr_j = Vec{W,T}(twr[6p+j]); wi_j = Vec{W,T}(twi[6p+j])
             end
             xb = s * p; yb = 7 * s * p
-            for q in QWin(s, W)
+            for q in QWin(qrange, W)
                 Base.Cartesian.@nexprs 7 j -> begin
                     xr_j = vload(Vec{W,T}, xre, xb + (j - 1) * ms + q)
                     xi_j = vload(Vec{W,T}, xim, xb + (j - 1) * ms + q)
@@ -373,12 +390,12 @@ function stage7!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::Plan
             end
         end
     else
-        @inbounds for p in 0:m-1
+        @inbounds for p in prange
             Base.Cartesian.@nexprs 6 j -> begin
                 wr_j = twr[6p+j]; wi_j = twi[6p+j]
             end
             xb = s * p; yb = 7 * s * p
-            for q in 1:s
+            for q in qrange
                 Base.Cartesian.@nexprs 7 j -> begin
                     xr_j = xre[xb+(j-1)*ms+q]
                     xi_j = xim[xb+(j-1)*ms+q]
@@ -397,16 +414,18 @@ function stage7!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::Plan
 end
 
 function stage2!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
-                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}) where {T}
+                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T},
+                 prange::UnitRange{Int}=0:(n >>> 1)-1,
+                 qrange::UnitRange{Int}=1:s) where {T}
     m = n >>> 1
     ms = m * s
     W = pick_width(T)
-    if W > 1 && s ≥ W
-        @inbounds for p in 0:m-1
+    if W > 1 && length(qrange) ≥ W
+        @inbounds for p in prange
             wr = Vec{W,T}(twr[p+1]); wi = Vec{W,T}(twi[p+1])
             xb = s * p
             yb = 2 * s * p
-            for q in QWin(s, W)
+            for q in QWin(qrange, W)
                 ar = vload(Vec{W,T}, xre, xb + q);      ai = vload(Vec{W,T}, xim, xb + q)
                 br = vload(Vec{W,T}, xre, xb + ms + q); bi = vload(Vec{W,T}, xim, xb + ms + q)
                 y0r, y0i, y1r, y1i = bf2(ar, ai, br, bi, wr, wi)
@@ -415,11 +434,11 @@ function stage2!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::Plan
             end
         end
     else
-        @inbounds for p in 0:m-1
+        @inbounds for p in prange
             wr = twr[p+1]; wi = twi[p+1]
             xb = s * p
             yb = 2 * s * p
-            for q in 1:s
+            for q in qrange
                 y0r, y0i, y1r, y1i =
                     bf2(xre[xb+q], xim[xb+q], xre[xb+ms+q], xim[xb+ms+q], wr, wi)
                 yre[yb+q] = y0r;    yim[yb+q] = y0i
@@ -434,20 +453,32 @@ end
 # Whole-array split<->interleaved conversion passes (fallback edges for plans
 # whose first/last stage can't fuse the conversion).
 
+function _deinterleave_range!(are::Vector{T}, aim::Vector{T}, px::Ptr{T},
+                              clo::Int, chi::Int) where {T}
+    W = pick_width(T)
+    sz = sizeof(T)
+    @inbounds for c in QWin(clo, chi, W)
+        u = vload(Vec{W,T}, px + sz * 2 * (c - 1))
+        v = vload(Vec{W,T}, px + sz * (2 * (c - 1) + W))
+        r, i = deinterleave2(u, v)
+        vstore(r, are, c)
+        vstore(i, aim, c)
+    end
+    return nothing
+end
+
 function deinterleave_all!(are::Vector{T}, aim::Vector{T},
-                           x::AbstractArray{Complex{T}}) where {T}
+                           x::AbstractArray{Complex{T}}, nt::Int=1) where {T}
     len = length(x)
     W = pick_width(T)
     if W > 1 && len ≥ W
         GC.@preserve x begin
             px = _rawptr(x)
-            sz = sizeof(T)
-            @inbounds for c in QWin(len, W)
-                u = vload(Vec{W,T}, px + sz * 2 * (c - 1))
-                v = vload(Vec{W,T}, px + sz * (2 * (c - 1) + W))
-                r, i = deinterleave2(u, v)
-                vstore(r, are, c)
-                vstore(i, aim, c)
+            if nt > 1
+                tforeach((lo, hi) -> _deinterleave_range!(are, aim, px, lo, hi),
+                         len, nt; align=W)
+            else
+                _deinterleave_range!(are, aim, px, 1, len)
             end
         end
     else
@@ -459,21 +490,33 @@ function deinterleave_all!(are::Vector{T}, aim::Vector{T},
     return nothing
 end
 
+function _interleave_range!(py::Ptr{T}, are::Vector{T}, aim::Vector{T},
+                            scale::T, clo::Int, chi::Int) where {T}
+    W = pick_width(T)
+    sz = sizeof(T)
+    sc = Vec{W,T}(scale)
+    @inbounds for c in QWin(clo, chi, W)
+        r = vload(Vec{W,T}, are, c) * sc
+        i = vload(Vec{W,T}, aim, c) * sc
+        lo, hi = interleave_chunks(r, i, Val(1))
+        vstore(lo, py + sz * 2 * (c - 1))
+        vstore(hi, py + sz * (2 * (c - 1) + W))
+    end
+    return nothing
+end
+
 function interleave_all!(y::AbstractArray{Complex{T}}, are::Vector{T}, aim::Vector{T},
-                         scale::T) where {T}
+                         scale::T, nt::Int=1) where {T}
     len = length(y)
     W = pick_width(T)
     if W > 1 && len ≥ W
         GC.@preserve y begin
             py = _rawptr(y)
-            sz = sizeof(T)
-            sc = Vec{W,T}(scale)
-            @inbounds for c in QWin(len, W)
-                r = vload(Vec{W,T}, are, c) * sc
-                i = vload(Vec{W,T}, aim, c) * sc
-                lo, hi = interleave_chunks(r, i, Val(1))
-                vstore(lo, py + sz * 2 * (c - 1))
-                vstore(hi, py + sz * (2 * (c - 1) + W))
+            if nt > 1
+                tforeach((lo, hi) -> _interleave_range!(py, are, aim, scale, lo, hi),
+                         len, nt; align=W)
+            else
+                _interleave_range!(py, are, aim, scale, 1, len)
             end
         end
     else
@@ -489,12 +532,12 @@ end
 # block's first element; requires s ≥ W.
 function stage4_ilvin!(yre::PlaneVec{T}, yim::PlaneVec{T}, px::Ptr{T},
                        n::Int, s::Int, twr::Vector{T}, twi::Vector{T},
-                       d::Val{D}) where {T,D}
+                       d::Val{D}, prange::UnitRange{Int}=0:(n >>> 2)-1) where {T,D}
     m = n >>> 2
     ms = m * s
     W = pick_width(T)
     sz = sizeof(T)
-    @inbounds for p in 0:m-1
+    @inbounds for p in prange
         w1r = Vec{W,T}(twr[3p+1]); w1i = Vec{W,T}(twi[3p+1])
         w2r = Vec{W,T}(twr[3p+2]); w2i = Vec{W,T}(twi[3p+2])
         w3r = Vec{W,T}(twr[3p+3]); w3i = Vec{W,T}(twi[3p+3])
@@ -529,10 +572,11 @@ end
 # C×R. W×W tiles go through the register transpose; QWin overlap covers
 # non-multiple extents (recomputed tiles store identical values). Scalar path
 # for extents below one tile.
-function transpose_plane!(dst::Vector{T}, src::Vector{T}, R::Int, C::Int) where {T}
+function transpose_plane!(dst::Vector{T}, src::Vector{T}, R::Int, C::Int,
+                          crange::UnitRange{Int}=1:C) where {T}
     W = pick_width(T)
-    if W > 1 && R ≥ W && C ≥ W
-        @inbounds for cb in QWin(C, W), rb in QWin(R, W)
+    if W > 1 && R ≥ W && length(crange) ≥ W
+        @inbounds for cb in QWin(crange, W), rb in QWin(R, W)
             tile = ntuple(j -> vload(Vec{W,T}, src, rb + R * (cb + j - 2)), Val(W))
             tt = vtranspose(tile)
             for i in 1:W
@@ -540,7 +584,7 @@ function transpose_plane!(dst::Vector{T}, src::Vector{T}, R::Int, C::Int) where 
             end
         end
     else
-        @inbounds for c in 0:C-1, r in 0:R-1
+        @inbounds for c in first(crange)-1:last(crange)-1, r in 0:R-1
             dst[c+1+C*r] = src[r+1+R*c]
         end
     end
@@ -552,11 +596,25 @@ end
 # (B×(h+1)). Requires B ≥ W. Twiddles e^{-2πik/n} broadcast per k.
 function rfft_post_batched!(yre::Vector{T}, yim::Vector{T},
                             zre::Vector{T}, zim::Vector{T}, B::Int, h::Int,
-                            twr::Vector{T}, twi::Vector{T}) where {T}
+                            twr::Vector{T}, twi::Vector{T}, nt::Int=1) where {T}
+    if nt > 1
+        tforeach((lo, hi) -> _rfft_post_range!(yre, yim, zre, zim, B, h,
+                                               twr, twi, lo, hi),
+                 B, nt; align=pick_width(T))
+    else
+        _rfft_post_range!(yre, yim, zre, zim, B, h, twr, twi, 1, B)
+    end
+    return nothing
+end
+
+function _rfft_post_range!(yre::Vector{T}, yim::Vector{T},
+                           zre::Vector{T}, zim::Vector{T}, B::Int, h::Int,
+                           twr::Vector{T}, twi::Vector{T},
+                           qlo::Int, qhi::Int) where {T}
     W = pick_width(T)
     hv = Vec{W,T}(T(0.5))
     zv = Vec{W,T}(zero(T))
-    @inbounds for q in QWin(B, W)
+    @inbounds for q in QWin(qlo, qhi, W)
         z0r = vload(Vec{W,T}, zre, q)
         z0i = vload(Vec{W,T}, zim, q)
         vstore(z0r + z0i, yre, q);         vstore(zv, yim, q)
@@ -580,10 +638,25 @@ end
 # pre carries the pair factor and any folded normalization; twiddles e^{+2πik/n}.
 function irfft_pre_batched!(zre::Vector{T}, zim::Vector{T},
                             xre::Vector{T}, xim::Vector{T}, B::Int, h::Int,
-                            twr::Vector{T}, twi::Vector{T}, pre::T) where {T}
+                            twr::Vector{T}, twi::Vector{T}, pre::T,
+                            nt::Int=1) where {T}
+    if nt > 1
+        tforeach((lo, hi) -> _irfft_pre_range!(zre, zim, xre, xim, B, h,
+                                               twr, twi, pre, lo, hi),
+                 B, nt; align=pick_width(T))
+    else
+        _irfft_pre_range!(zre, zim, xre, xim, B, h, twr, twi, pre, 1, B)
+    end
+    return nothing
+end
+
+function _irfft_pre_range!(zre::Vector{T}, zim::Vector{T},
+                           xre::Vector{T}, xim::Vector{T}, B::Int, h::Int,
+                           twr::Vector{T}, twi::Vector{T}, pre::T,
+                           qlo::Int, qhi::Int) where {T}
     W = pick_width(T)
     pv = Vec{W,T}(pre)
-    @inbounds for q in QWin(B, W)
+    @inbounds for q in QWin(qlo, qhi, W)
         for k in 0:h-1
             ar = vload(Vec{W,T}, xre, B * k + q)
             ai = vload(Vec{W,T}, xim, B * k + q)

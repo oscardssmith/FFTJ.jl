@@ -13,6 +13,7 @@ export plan_fft, plan_ifft, plan_bfft, plan_fft!, plan_ifft!, plan_bfft!,
        fftshift, ifftshift, fftfreq, rfftfreq, Frequencies,
        FFTPlan
 
+include("threads.jl")
 include("kernels.jl")
 include("stockham.jl")
 include("plan.jl")

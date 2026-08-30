@@ -22,12 +22,15 @@ using Random: Xoshiro
         # round trip
         @test norm(pinv(y) .- x) ≤ 50 * eps(T) * norm(x)
 
-        # in-place-into-output form, and it must not allocate
+        # in-place-into-output form, and it must not allocate (threaded plans
+        # may allocate task objects, so the guarantee is for nthreads=1)
         y2 = similar(x)
         p(y2, x)
         @test y2 == y
-        p(y2, x)
-        @test (@allocated p(y2, x)) == 0
+        p1 = plan_fft(T, n; nthreads=1)
+        p1(y2, x)
+        p1(y2, x)
+        @test (@allocated p1(y2, x)) == 0
     end
 end
 
@@ -205,10 +208,13 @@ end
         @test pbr * Xr ≈ bref atol = tol(bref)
         @test plan_irfft(Xr, n1) * Xr ≈ xr atol = tol(xr)
 
-        # allocation-free planned execution
+        # allocation-free planned execution (threaded plans may allocate task
+        # objects, so the guarantee is for nthreads=1)
         if prod(dims) > 32
-            mul!(z, p, x)
-            @test (@allocated mul!(z, p, x)) == 0
+            ps = plan_fft(x; nthreads=1)
+            mul!(z, ps, x)
+            mul!(z, ps, x)
+            @test (@allocated mul!(z, ps, x)) == 0
         end
     end
     # one-shots
@@ -220,6 +226,8 @@ end
     @test irfft(rfft(Ar), 20) ≈ Ar atol = tol(Ar)
     @test fft!(copy(A)) ≈ FFTW.fft(ComplexF64.(A)) atol = tol(FFTW.fft(ComplexF64.(A)))
 end
+
+include("threading.jl")
 
 @testset "argument checking" begin
     @test_throws ArgumentError plan_fft(Float64, 0)

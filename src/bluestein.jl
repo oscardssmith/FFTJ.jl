@@ -55,12 +55,12 @@ function _bluestein_parts(::Type{T}, n::Int, D::Int) where {T}
     return r::Tuple{Int,Vector{Complex{T}},Vector{Complex{T}}}
 end
 
-function _bluestein(::Type{T}, n::Int, D::Int,
-                    scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
+function _bluestein(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
+                    nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     N, c, ghat = _bluestein_parts(T, n, D)
-    pf = _plan(T, N, -1)
+    pf = _plan(T, N, -1; nthreads)
     # pf and pinv only ever run sequentially, so they share scratch planes
-    pinv = _plan(T, N, +1; bufs=(pf.are, pf.aim, pf.bre, pf.bim))
+    pinv = _plan(T, N, +1; bufs=(pf.are, pf.aim, pf.bre, pf.bim), nthreads)
     return BluesteinPlan{T,D}(n, c, ghat, pf, pinv,
                               Vector{Complex{T}}(undef, N),
                               Vector{Complex{T}}(undef, N), scale)
@@ -91,3 +91,5 @@ function (p::BluesteinPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
 end
 
 (p::BluesteinPlan{T})(x::Vector{Complex{T}}) where {T} = p(similar(x), x)
+
+plan_nt(p::BluesteinPlan) = p.pf.nt

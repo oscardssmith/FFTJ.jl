@@ -38,12 +38,13 @@ function real_twiddles(::Type{T}, n::Int, len::Int, D::Int) where {T}
     return r::Tuple{Vector{T},Vector{T}}
 end
 
-function plan_rfft(::Type{T}, n::Integer) where {T<:AbstractFloat}
+function plan_rfft(::Type{T}, n::Integer;
+                   nthreads::Integer=Threads.nthreads()) where {T<:AbstractFloat}
     n = Int(n)
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
     even = iseven(n)
     len = even ? n >>> 1 : n
-    inner = _anyplan(T, len, -1)
+    inner = _anyplan(T, len, -1; nthreads=Int(nthreads))
     twr, twi = even ? real_twiddles(T, n, len + 1, -1) : (T[], T[])
     return RfftPlan{T,typeof(inner)}(n, inner, twr, twi,
                                      Vector{Complex{T}}(undef, len),
@@ -53,21 +54,27 @@ end
 # normalized = true gives irfft (1/n folded in); false gives FFTW-style brfft
 # (unnormalized: brfft = n·irfft, via an unnormalized inner transform and a
 # pre-pass pair factor of 1 instead of 1/2).
-function plan_irfft(::Type{T}, n::Integer; normalized::Bool=true) where {T<:AbstractFloat}
+function plan_irfft(::Type{T}, n::Integer; normalized::Bool=true,
+                    nthreads::Integer=Threads.nthreads()) where {T<:AbstractFloat}
     n = Int(n)
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
     pre = normalized ? T(0.5) : one(T)
     even = iseven(n)
     len = even ? n >>> 1 : n
-    inner = normalized ? _anyplan(T, len, +1) : _anyplan(T, len, +1, one(T))
+    inner = normalized ? _anyplan(T, len, +1; nthreads=Int(nthreads)) :
+            _anyplan(T, len, +1, one(T); nthreads=Int(nthreads))
     twr, twi = even ? real_twiddles(T, n, len, +1) : (T[], T[])
     return IrfftPlan{T,typeof(inner)}(n, inner, pre, twr, twi,
                                       Vector{Complex{T}}(undef, len),
                                       Vector{Complex{T}}(undef, even ? 0 : n))
 end
 
-plan_brfft(::Type{T}, n::Integer) where {T<:AbstractFloat} =
-    plan_irfft(T, n; normalized=false)
+plan_brfft(::Type{T}, n::Integer; nthreads::Integer=Threads.nthreads()) where {T<:AbstractFloat} =
+    plan_irfft(T, n; normalized=false, nthreads)
+
+# the real edge passes run serial; the threading lives in the inner plan
+plan_nt(p::RfftPlan) = plan_nt(p.inner)
+plan_nt(p::IrfftPlan) = plan_nt(p.inner)
 
 # y may be a contiguous view (e.g. the leading half of a longer spectrum buffer)
 function (p::RfftPlan{T})(y::AbstractVector{Complex{T}}, x::AbstractVector{T}) where {T}

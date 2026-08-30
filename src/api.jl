@@ -15,9 +15,12 @@ struct InplacePlan{P}
     p::P
 end
 
-plan_fft!(::Type{T}, n::Integer) where {T<:AbstractFloat} = InplacePlan(plan_fft(T, n))
-plan_ifft!(::Type{T}, n::Integer) where {T<:AbstractFloat} = InplacePlan(plan_ifft(T, n))
-plan_bfft!(::Type{T}, n::Integer) where {T<:AbstractFloat} = InplacePlan(plan_bfft(T, n))
+plan_fft!(::Type{T}, n::Integer; kws...) where {T<:AbstractFloat} =
+    InplacePlan(plan_fft(T, n; kws...))
+plan_ifft!(::Type{T}, n::Integer; kws...) where {T<:AbstractFloat} =
+    InplacePlan(plan_ifft(T, n; kws...))
+plan_bfft!(::Type{T}, n::Integer; kws...) where {T<:AbstractFloat} =
+    InplacePlan(plan_bfft(T, n; kws...))
 
 # a plan scaled by a constant, as produced by inv; .p and .scale are public
 # (DSP unwraps inv(p).p to get the unnormalized inverse)
@@ -63,12 +66,13 @@ _dir(::BluesteinPlan{T,D}) where {T,D} = D
 # forward; unnormalized backward ↦ scaled forward.
 function Base.inv(p::AnyPlan{T}) where {T}
     n = p.n
+    nthreads = plan_nt(p)   # inherit the parent's threading
     if _dir(p) == -1
-        return Scaled(plan_bfft(T, n), one(T) / n)
+        return Scaled(plan_bfft(T, n; nthreads), one(T) / n)
     elseif p.scale == 1
-        return Scaled(plan_fft(T, n), one(T) / n)
+        return Scaled(plan_fft(T, n; nthreads), one(T) / n)
     else
-        return plan_fft(T, n)
+        return plan_fft(T, n; nthreads)
     end
 end
 function Base.inv(ip::InplacePlan)
@@ -92,18 +96,23 @@ _checkregion_nd(region, N) =
     region == 1:N || region == ntuple(identity, N) || (N == 1 && region == 1) ||
     throw(ArgumentError("FFTJ N-d plans transform all dims (expected region 1:$N, got $region)"))
 
-function plan_fft(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+function plan_fft(x::Array{Complex{T},N}, region=1:N;
+                  nthreads::Integer=Threads.nthreads(), kws...) where {T<:AbstractFloat,N}
     _checkregion_nd(region, N)
-    return N == 1 ? plan_fft(T, length(x)) : _ndplan(T, size(x), -1, one(T))
+    return N == 1 ? plan_fft(T, length(x); nthreads) :
+           _ndplan(T, size(x), -1, one(T); nthreads=Int(nthreads))
 end
-function plan_bfft(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+function plan_bfft(x::Array{Complex{T},N}, region=1:N;
+                   nthreads::Integer=Threads.nthreads(), kws...) where {T<:AbstractFloat,N}
     _checkregion_nd(region, N)
-    return N == 1 ? plan_bfft(T, length(x)) : _ndplan(T, size(x), +1, one(T))
+    return N == 1 ? plan_bfft(T, length(x); nthreads) :
+           _ndplan(T, size(x), +1, one(T); nthreads=Int(nthreads))
 end
-function plan_ifft(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+function plan_ifft(x::Array{Complex{T},N}, region=1:N;
+                   nthreads::Integer=Threads.nthreads(), kws...) where {T<:AbstractFloat,N}
     _checkregion_nd(region, N)
-    return N == 1 ? plan_ifft(T, length(x)) :
-           _ndplan(T, size(x), +1, one(T) / length(x))
+    return N == 1 ? plan_ifft(T, length(x); nthreads) :
+           _ndplan(T, size(x), +1, one(T) / length(x); nthreads=Int(nthreads))
 end
 plan_fft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N} =
     InplacePlan(plan_fft(x, region; kws...))
@@ -111,25 +120,29 @@ plan_bfft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N
     InplacePlan(plan_bfft(x, region; kws...))
 plan_ifft!(x::Array{Complex{T},N}, region=1:N; kws...) where {T<:AbstractFloat,N} =
     InplacePlan(plan_ifft(x, region; kws...))
-function plan_rfft(x::Array{T,N}, region=1:N; kws...) where {T<:AbstractFloat,N}
+function plan_rfft(x::Array{T,N}, region=1:N;
+                   nthreads::Integer=Threads.nthreads(), kws...) where {T<:AbstractFloat,N}
     _checkregion_nd(region, N)
-    return N == 1 ? plan_rfft(T, length(x)) : _ndrfft(T, size(x))
+    return N == 1 ? plan_rfft(T, length(x); nthreads) :
+           _ndrfft(T, size(x); nthreads=Int(nthreads))
 end
 function plan_brfft(X::Array{Complex{T},N}, n1::Integer, region=1:N;
-                    kws...) where {T<:AbstractFloat,N}
+                    nthreads::Integer=Threads.nthreads(), kws...) where {T<:AbstractFloat,N}
     _checkregion_nd(region, N)
     size(X, 1) == n1 ÷ 2 + 1 ||
         throw(DimensionMismatch("brfft of leading length $n1 needs $(n1 ÷ 2 + 1) rows, got $(size(X, 1))"))
-    return N == 1 ? plan_brfft(T, n1) :
-           _ndirfft(T, (Int(n1), size(X)[2:N]...); normalized=false)
+    return N == 1 ? plan_brfft(T, n1; nthreads) :
+           _ndirfft(T, (Int(n1), size(X)[2:N]...); normalized=false,
+                    nthreads=Int(nthreads))
 end
 function plan_irfft(X::Array{Complex{T},N}, n1::Integer, region=1:N;
-                    kws...) where {T<:AbstractFloat,N}
+                    nthreads::Integer=Threads.nthreads(), kws...) where {T<:AbstractFloat,N}
     _checkregion_nd(region, N)
     size(X, 1) == n1 ÷ 2 + 1 ||
         throw(DimensionMismatch("irfft of leading length $n1 needs $(n1 ÷ 2 + 1) rows, got $(size(X, 1))"))
-    return N == 1 ? plan_irfft(T, n1) :
-           _ndirfft(T, (Int(n1), size(X)[2:N]...); normalized=true)
+    return N == 1 ? plan_irfft(T, n1; nthreads) :
+           _ndirfft(T, (Int(n1), size(X)[2:N]...); normalized=true,
+                    nthreads=Int(nthreads))
 end
 
 LinearAlgebra.mul!(y::Array{Complex{T},N}, p::NdPlan{T,D,N},
@@ -147,12 +160,13 @@ Base.size(p::RfftNdPlan) = p.rdims
 Base.size(p::IrfftNdPlan) = p.cdims
 
 function Base.inv(p::NdPlan{T,D,N}) where {T,D,N}
+    nthreads = p.nt   # inherit the parent's threading
     if D == -1
-        return Scaled(_ndplan(T, p.dims, +1, one(T)), one(T) / p.len)
+        return Scaled(_ndplan(T, p.dims, +1, one(T); nthreads), one(T) / p.len)
     elseif p.scale == 1
-        return Scaled(_ndplan(T, p.dims, -1, one(T)), one(T) / p.len)
+        return Scaled(_ndplan(T, p.dims, -1, one(T); nthreads), one(T) / p.len)
     else
-        return _ndplan(T, p.dims, -1, one(T))
+        return _ndplan(T, p.dims, -1, one(T); nthreads)
     end
 end
 
