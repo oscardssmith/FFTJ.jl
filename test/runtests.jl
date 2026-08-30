@@ -227,6 +227,24 @@ end
     @test fft!(copy(A)) ≈ FFTW.fft(ComplexF64.(A)) atol = tol(FFTW.fft(ComplexF64.(A)))
 end
 
+@testset "smooth-size routing" begin
+    # Float64 (and any W ≤ 8 host): direct chains beat Bluestein at every
+    # smooth size (measured 2026-08), so smooth n never routes to Bluestein
+    for n in (405, 2835, 3^8, 3^12, 2 * 3^6 * 5^2 * 7^2)
+        @test plan_fft(Float64, n) isa FFTJ.FFTPlan
+    end
+    # non-smooth still routes to Bluestein
+    @test plan_fft(Float64, 10007) isa FFTJ.BluesteinPlan
+    @test plan_fft(Float32, 10007) isa FFTJ.BluesteinPlan
+    if FFTJ.pick_width(Float32) ≥ 16
+        # wide-vector Float32: scalar-stride odd stages keep Bluestein ahead
+        # for small odd-heavy sizes, direct wins above the measured crossover
+        @test plan_fft(Float32, 729) isa FFTJ.BluesteinPlan
+        @test plan_fft(Float32, 3^12) isa FFTJ.FFTPlan
+        @test plan_fft(Float32, 2 * 3^6 * 5^2 * 7^2) isa FFTJ.FFTPlan
+    end
+end
+
 include("threading.jl")
 
 @testset "argument checking" begin

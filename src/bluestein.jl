@@ -66,26 +66,54 @@ function _bluestein(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                               Vector{Complex{T}}(undef, N), scale)
 end
 
+# the elementwise passes, over index ranges so they can be chunked across
+# tasks (pure elementwise maps: chunking is trivially bitwise-safe)
+function _bs_chirp_in!(a, x, c, n::Int, lo::Int, hi::Int)
+    @inbounds for j in lo:min(hi, n)
+        a[j] = x[j] * c[j]
+    end
+    @inbounds for j in max(lo, n + 1):hi
+        a[j] = zero(eltype(a))
+    end
+    return nothing
+end
+function _bs_ghat!(b, ghat, lo::Int, hi::Int)
+    @inbounds @simd for j in lo:hi
+        b[j] *= ghat[j]
+    end
+    return nothing
+end
+function _bs_chirp_out!(y, c, a, sc, lo::Int, hi::Int)
+    @inbounds for k in lo:hi
+        y[k] = sc * (c[k] * a[k])
+    end
+    return nothing
+end
+
 function (p::BluesteinPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
     n = p.n
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
     a, b, c, ghat = p.a, p.b, p.c, p.ghat
     N = length(a)
-    @inbounds for j in 1:n
-        a[j] = x[j] * c[j]
-    end
-    @inbounds for j in n+1:N
-        a[j] = zero(Complex{T})
+    nt = p.pf.nt
+    if nt > 1
+        tforeach((lo, hi) -> _bs_chirp_in!(a, x, c, n, lo, hi), N, nt)
+    else
+        _bs_chirp_in!(a, x, c, n, 1, N)
     end
     p.pf(b, a)
-    @inbounds @simd for j in 1:N
-        b[j] *= ghat[j]
+    if nt > 1
+        tforeach((lo, hi) -> _bs_ghat!(b, ghat, lo, hi), N, nt)
+    else
+        _bs_ghat!(b, ghat, 1, N)
     end
     p.pinv(a, b)
     sc = p.scale
-    @inbounds for k in 1:n
-        y[k] = sc * (c[k] * a[k])
+    if nt > 1
+        tforeach((lo, hi) -> _bs_chirp_out!(y, c, a, sc, lo, hi), n, nt)
+    else
+        _bs_chirp_out!(y, c, a, sc, 1, n)
     end
     return y
 end

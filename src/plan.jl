@@ -134,12 +134,17 @@ function _plan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                         plan_tasks(n, nthreads), scale)
 end
 
-# A smooth length whose odd stages would run at scalar strides (small 2-part)
-# is faster as an exact Bluestein over a padded pow2-rich length than as a
-# direct chain, once n is large enough to amortize the two transforms.
+# Routing for smooth-but-odd-heavy lengths (measured 2026-08, see the
+# threading spec): direct chains beat Bluestein at every smooth size for
+# W ≤ 8 (the two padded transforms cost ~5× the butterfly work, and threaded
+# q-splits keep odd stages vectorized), so only wide-vector Float32 (W ≥ 16)
+# keeps the Bluestein route, for the small odd-heavy sizes where odd stages
+# run at scalar strides: crossover measured between 3^8 = 6561 (Bluestein
+# 1.4× ahead) and 14175 (direct 1.5× ahead).
 function _slow_smooth(::Type{T}, n::Int, fac) where {T}
     a, b, c, d = fac
-    return b + c + d > 0 && n ≥ 256 && (1 << a) < 4 * pick_width(T)
+    W = pick_width(T)
+    return W ≥ 16 && b + c + d > 0 && 256 ≤ n ≤ 8192 && (1 << a) < 4 * W
 end
 
 function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
