@@ -15,12 +15,13 @@ end
 # four-step only pays when threaded.)
 serial_like(p::FFTJ.FFTPlan{T,D}) where {T,D} =
     FFTJ._plan(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::FFTJ.FourStepPlan{T,D}) where {T,D} =
-    FFTJ._fourstep(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::FFTJ.BluesteinPlan{T,D}) where {T,D} =
-    FFTJ.BluesteinPlan{T,D}(p.n, p.c, p.ghat, serial_like(p.pf),
-                            serial_like(p.pinv), similar(p.a), similar(p.b),
-                            p.scale)
+serial_like(p::FFTJ.SixStepPlan{T,D}) where {T,D} =
+    FFTJ._sixstep(T, p.n, D, p.scale; nthreads=1)
+serial_like(p::Union{FFTJ.FourStepPlan,FFTJ.ResamplePlan,FFTJ.CompositePlan}) = p
+
+# plan types with no threaded execution yet
+serial_only(p) = p isa Union{FFTJ.ResamplePlan,FFTJ.CompositePlan} ||
+                 (p isa Union{FFTJ.RfftPlan,FFTJ.IrfftPlan} && serial_only(p.inner))
 function serial_like(p::FFTJ.RfftPlan{T}) where {T}
     inner = serial_like(p.inner)
     return FFTJ.RfftPlan{T,typeof(inner)}(p.n, inner, p.twr, p.twi,
@@ -73,14 +74,17 @@ end
     rng = Xoshiro(0x7472)
     # 2^20: fused radix-4 chain; 2^19: radix-8 last stage; 3·2^18: radix-3
     # stage; 3^4·5·7·2^10: all odd radices; 1441440: radix-11/13 stages;
-    # 2^22 and 3·2^21: four-step; 1000003: prime → Bluestein (four-step inner)
+    # 2^22 and 3·2^21: six-step; 1000003: prime → resampling (serial)
     ns = [2^20, 2^19, 3 * 2^18, 3^4 * 5 * 7 * 2^10, 1441440, 2^22, 3 * 2^21,
           1000003]
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         p1 = plan_fft(T, n; nthreads=1)
         pt = plan_fft(T, n)
-        Threads.nthreads() > 1 && @test FFTJ.plan_nt(pt) > 1
+        if Threads.nthreads() > 1
+            serial_only(pt) ? (@test_broken FFTJ.plan_nt(pt) > 1) :
+                              (@test FFTJ.plan_nt(pt) > 1)
+        end
         p1s = serial_like(pt)
         yt = pt(x)
         @test yt == p1s(x)            # bitwise-identical to same-algorithm serial
@@ -111,7 +115,7 @@ end
     rng = Xoshiro(0xd7d)
     # (1024,512): block-parallel passes; (2^16,4): last dim has Bo=1 → intra-
     # stage; (4,2^16): dim-1 batched-transposed chain; (513,255): both dims
-    # non-smooth → parallel Bluestein pencil fallback; (256,33,17): 3-d mixed
+    # non-smooth → batched resampling passes; (256,33,17): 3-d mixed
     shapes = [(1024, 512), (2^16, 4), (4, 2^16), (513, 255), (256, 33, 17)]
     @testset "dims = $dims" for dims in shapes
         x = randn(rng, Complex{T}, dims)
@@ -147,12 +151,15 @@ end
 @testset "threaded real transforms vs serial ($T)" for T in (Float32, Float64)
     rng = Xoshiro(0x5ea1)
     # 2^20: even, half-complex fast path; 3·2^19: even mixed-radix half;
-    # 1000003: odd → full-length complex Bluestein fallback
+    # 1000003: odd → full-length complex resampling fallback (serial)
     @testset "1-D n = $n" for n in (2^20, 3 * 2^19, 1000003)
         x = randn(rng, T, n)
         pr1 = plan_rfft(T, n; nthreads=1)
         prt = plan_rfft(T, n)
-        Threads.nthreads() > 1 && @test FFTJ.plan_nt(prt) > 1
+        if Threads.nthreads() > 1
+            serial_only(prt) ? (@test_broken FFTJ.plan_nt(prt) > 1) :
+                               (@test FFTJ.plan_nt(prt) > 1)
+        end
         Xt = prt(x)
         @test Xt == serial_like(prt)(x)
         ref = FFTW.rfft(Float64.(x))

@@ -54,22 +54,86 @@ end
     end
 end
 
-@testset "bluestein (non-smooth n) vs FFTW ($T)" for T in (Float32, Float64)
+@testset "resampled (non-smooth n) vs FFTW ($T)" for T in (Float32, Float64)
     rng = Xoshiro(0xb1e)
-    ns = [11, 13, 17, 22, 26, 33, 39, 97, 101, 121, 169, 331, 997, 1025, 1234,
-          2049, 10007]
+    # includes one past the weight-table cap, and (F32 only) slow-smooth
+    # lengths with a small 2-part
+    ns = [17, 19, 23, 34, 38, 51, 97, 101, 289, 331, 361, 997, 1025, 1234,
+          2049, 10007, 65537]
+    T == Float32 && append!(ns, [3^7, 5^4 * 2, 3^4 * 5^2])
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         ref = FFTW.fft(ComplexF64.(x))
         p = plan_fft(T, n)
+        @test p isa FFTJ.ResamplePlan
         y = p(x)
         @test norm(y .- ref) ≤ 100 * eps(T) * norm(ref)
         pinv = plan_ifft(T, n)
         @test norm(pinv(y) .- x) ≤ 100 * eps(T) * norm(x)
+        pb = plan_bfft(T, n)
+        @test norm(pb(y) .- n .* x) ≤ 100 * eps(T) * n * norm(x)
         y2 = similar(x)
         p(y2, x)
         p(y2, x)
         @test (@allocated p(y2, x)) == 0
+    end
+end
+
+@testset "composite (smooth × non-smooth n) vs FFTW ($T)" for T in (Float32, Float64)
+    rng = Xoshiro(0xc0b)
+    ns = filter(n -> FFTJ._use_composite(T, n),
+                [17 * 1024, 101 * 64, 1009 * 16, 19 * 3072, 17 * 2^13, 101 * 1024,
+                 1009 * 64, 10007 * 32, 17 * 19 * 512, 3^4 * 5 * 7 * 101])
+    @test length(ns) ≥ 4
+    @testset "n = $n" for n in ns
+        x = randn(rng, Complex{T}, n)
+        ref = FFTW.fft(ComplexF64.(x))
+        p = plan_fft(T, n)
+        @test p isa FFTJ.CompositePlan
+        y = p(x)
+        @test norm(y .- ref) ≤ 100 * eps(T) * norm(ref)
+        pinv = plan_ifft(T, n)
+        @test norm(pinv(y) .- x) ≤ 100 * eps(T) * norm(x)
+        pb = plan_bfft(T, n)
+        @test norm(pb(y) .- n .* x) ≤ 100 * eps(T) * n * norm(x)
+        y2 = similar(x)
+        p(y2, x)
+        @test (@allocated p(y2, x)) == 0
+    end
+end
+
+@testset "four-step (out-of-cache n) vs FFTW ($T)" for T in (Float32, Float64)
+    rng = Xoshiro(0x4573)
+    ns = filter(n -> FFTJ._use_fourstep(T, n),
+                [2^17, 2^18, 2^20, 3 * 2^16, 5 * 2^16, 7 * 2^16, 9 * 2^15, 15 * 2^15])
+    @test length(ns) ≥ 6
+    @testset "n = $n" for n in ns
+        x = randn(rng, Complex{T}, n)
+        ref = FFTW.fft(ComplexF64.(x))
+        # threaded plans route to direct or six-step instead
+        p = plan_fft(T, n; nthreads=1)
+        @test p isa FFTJ.FourStepPlan
+        y = p(x)
+        @test norm(y .- ref) ≤ 50 * eps(T) * norm(ref)
+        pinv = plan_ifft(T, n; nthreads=1)
+        @test norm(pinv(y) .- x) ≤ 50 * eps(T) * norm(x)
+        y2 = similar(x)
+        p(y2, x)
+        @test y2 == y
+        @test (@allocated p(y2, x)) == 0
+    end
+    # lopsided splits nest one pass's inner transform at a testable size
+    W = FFTJ.pick_width(T)
+    n = 2^16
+    @testset "N2 = $N2" for N2 in (W, n ÷ W)
+        x = randn(rng, Complex{T}, n)
+        ref = FFTW.fft(ComplexF64.(x))
+        for D in (-1, 1)
+            p = FFTJ._fourstep(T, n, D; N2)
+            @test (p.innerA !== nothing) || (p.innerB !== nothing)
+            r = D == -1 ? ref : FFTW.ifft(ComplexF64.(x))
+            @test norm(p(x) .- r) ≤ 50 * eps(T) * norm(r)
+        end
     end
 end
 
@@ -232,21 +296,17 @@ end
 end
 
 @testset "smooth-size routing" begin
-    # Float64 (and any W ≤ 8 host): direct chains beat Bluestein at every
-    # smooth size (measured 2026-08), so smooth n never routes to Bluestein
-    for n in (405, 2835, 3^8, 3^12, 2 * 3^6 * 5^2 * 7^2)
+    # Float64: direct chains win at every smooth size, including 11/13 radices
+    for n in (405, 2835, 3^8, 3^12, 2 * 3^6 * 5^2 * 7^2, 11 * 1024, 13^3)
         @test plan_fft(Float64, n) isa FFTJ.FFTPlan
     end
-    # non-smooth still routes to Bluestein
-    @test plan_fft(Float64, 10007) isa FFTJ.BluesteinPlan
-    @test plan_fft(Float32, 10007) isa FFTJ.BluesteinPlan
-    if FFTJ.pick_width(Float32) ≥ 16
-        # wide-vector Float32: scalar-stride odd stages keep Bluestein ahead
-        # for small odd-heavy sizes, direct wins above the measured crossover
-        @test plan_fft(Float32, 729) isa FFTJ.BluesteinPlan
-        @test plan_fft(Float32, 3^12) isa FFTJ.FFTPlan
-        @test plan_fft(Float32, 2 * 3^6 * 5^2 * 7^2) isa FFTJ.FFTPlan
-    end
+    # non-smooth routes to resampling
+    @test plan_fft(Float64, 10007) isa FFTJ.ResamplePlan
+    @test plan_fft(Float32, 10007) isa FFTJ.ResamplePlan
+    # Float32: small odd-heavy sizes resample, larger ones run direct
+    @test plan_fft(Float32, 729) isa FFTJ.ResamplePlan
+    @test plan_fft(Float32, 3^12) isa FFTJ.FFTPlan
+    @test plan_fft(Float32, 2 * 3^6 * 5^2 * 7^2) isa FFTJ.FFTPlan
 end
 
 include("threading.jl")

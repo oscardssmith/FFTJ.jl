@@ -508,7 +508,9 @@ function transpose_plane!(dst::Vector{T}, src::Vector{T}, R::Int, C::Int,
             end
         end
     else
-        @inbounds for c in first(crange)-1:last(crange)-1, r in 0:R-1
+        # contiguous destination rows; reading src at stride R is cheap
+        # since one extent is below a vector
+        @inbounds for r in 0:R-1, c in first(crange)-1:last(crange)-1
             dst[c+1+C*r] = src[r+1+R*c]
         end
     end

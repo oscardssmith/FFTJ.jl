@@ -33,6 +33,17 @@ function factor_radices(n::Int)
     return a, ps
 end
 
+# exponents (a, b, c, d) of n = 2^a 3^b 5^c 7^d, or nothing when not 7-smooth
+function factor_smooth(n::Int)
+    a = trailing_zeros(n)
+    r = n >> a
+    b = 0; while r % 3 == 0; r ÷= 3; b += 1; end
+    c = 0; while r % 5 == 0; r ÷= 5; c += 1; end
+    d = 0; while r % 7 == 0; r ÷= 7; d += 1; end
+    r == 1 || return nothing
+    return a, b, c, d
+end
+
 # D: sign of the transform exponent (-1 forward, +1 inverse)
 struct FFTPlan{T,D}
     n::Int
@@ -120,8 +131,8 @@ function build_stages(::Type{T}, n::Int, D::Int; allow_small::Bool=true) where {
     return stages, f
 end
 
-# Immutable plan parts (stage chains with their twiddle tables, Bluestein
-# chirps, real-edge twiddles) are shared across plans, FFTW-style; entries
+# Immutable plan parts (stage chains with their twiddle tables, resampling
+# weights, real-edge twiddles) are shared across plans, FFTW-style; entries
 # live for the session and the GC handles the rest. Only per-plan scratch
 # buffers are allocated fresh, so repeated planning at one size is cheap —
 # DSP-style code plans per call.
@@ -136,41 +147,44 @@ function build_stages_cached(::Type{T}, n::Int, D::Int;
     return r::Tuple{Vector{Stage{T}},Int}
 end
 
-# bufs shares another plan's scratch planes (safe when the two plans never
-# execute concurrently, e.g. Bluestein's sequential forward/inverse pair)
 function _plan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
-               bufs::Union{Nothing,NTuple{4,Vector{T}}}=nothing,
                nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
     stages, _ = build_stages_cached(T, n, D)
-    if bufs === nothing
-        bufs = (Vector{T}(undef, n), Vector{T}(undef, n),
-                Vector{T}(undef, n), Vector{T}(undef, n))
-    end
-    return FFTPlan{T,D}(n, pencil_fused(T, n, stages), stages, bufs...,
+    return FFTPlan{T,D}(n, pencil_fused(T, n, stages), stages,
+                        Vector{T}(undef, n), Vector{T}(undef, n),
+                        Vector{T}(undef, n), Vector{T}(undef, n),
                         plan_tasks(n, nthreads), scale)
 end
 
-# Routing for smooth-but-odd-heavy lengths (measured 2026-08, see the
-# threading spec): direct chains beat Bluestein at every smooth size for
-# W ≤ 8 (the two padded transforms cost ~5× the butterfly work, and threaded
-# q-splits keep odd stages vectorized), so only wide-vector Float32 (W ≥ 16)
-# keeps the Bluestein route, for the small odd-heavy sizes where odd stages
-# run at scalar strides: crossover measured between 3^8 = 6561 (Bluestein
-# 1.4× ahead) and 14175 (direct 1.5× ahead).
+# A smooth length whose odd stages would run at scalar strides (small 2-part)
+# can be faster resampled onto a pow2-rich length than as a direct chain.
+# Measured only in F32, and only from ~48 to ~16k (it loses at 27 and from
+# ~17k); F64's direct chain won at every size measured.
 function _slow_smooth(::Type{T}, n::Int) where {T}
-    W = pick_width(T)
     a = trailing_zeros(n)
-    return W ≥ 16 && n >> a > 1 && 256 ≤ n ≤ 8192 && (1 << a) < 4 * W
+    return sizeof(T) < 8 && n >> a > 1 && 48 ≤ n ≤ 16384 &&
+           (1 << a) < 4 * pick_width(T)
 end
 
+# Routing: lengths without a fast chain are resampled (only their
+# non-smooth factor, when the smooth one is large enough). Large smooth
+# lengths run six-step when threaded and four-step when serial; the rest
+# run the stage chain directly.
 function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                   nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
-    if factor_radices(n) === nothing || _slow_smooth(T, n)
-        return _bluestein(T, n, D, scale; nthreads)
+    if factor_radices(n) === nothing
+        _use_composite(T, n) && return _composite(T, n, D, scale)
+        return _resample(T, n, D, scale)
     end
-    return _smoothplan(T, n, D, scale; nthreads)
+    _slow_smooth(T, n) && return _resample(T, n, D, scale)
+    if plan_tasks(n, nthreads) > 1
+        n ≥ SIXSTEP_MIN && return _sixstep(T, n, D, scale; nthreads)
+    else
+        _use_fourstep(T, n) && return _fourstep(T, n, D, scale)
+    end
+    return _plan(T, n, D, scale; nthreads)
 end
 plan_fft(::Type{T}, n::Integer; nthreads::Integer=Threads.nthreads()) where {T<:AbstractFloat} =
     _anyplan(T, Int(n), -1; nthreads=Int(nthreads))

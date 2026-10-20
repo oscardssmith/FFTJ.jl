@@ -10,10 +10,7 @@ struct DimPass{T}
     Bo::Int
     stages::Vector{Stage{T}}   # empty when fallback is used
     bstages::Vector{Stage{T}}  # batched-transposed chain (dim 1 only; may be empty)
-    fallback::Union{Nothing,BluesteinPlan{T,-1},BluesteinPlan{T,1}}
-    # serial clones of fallback for parallel pencil execution (share the cached
-    # chirp/ghat/stage chains, own scratch); empty when the pass is serial
-    fallbacks::Vector{Any}
+    fallback::Union{Nothing,RsPass{T}}   # non-smooth dims: batched resampling
 end
 
 struct NdPlan{T,D,N}
@@ -24,8 +21,6 @@ struct NdPlan{T,D,N}
     aim::Vector{T}
     bre::Vector{T}
     bim::Vector{T}
-    pbufs::Vector{Vector{Complex{T}}}  # per-task pencil gather buffers for
-    pbufs2::Vector{Vector{Complex{T}}} # non-smooth dims ([1] is the serial one)
     fuse_in::Bool              # first pass's first stage reads interleaved input
     fuse_out::Bool             # last pass's final stage writes interleaved output
     dim1_batched::Bool         # dim 1 runs transposed with pencils as lanes
@@ -55,7 +50,6 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
     W = pick_width(T)
     nt = plan_tasks(len, nthreads)
     passes = DimPass{T}[]
-    maxfb = 0
     for d in first_dim:N
         nd = dims[d]
         nd == 1 && continue
@@ -70,19 +64,11 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
             else
                 Stage{T}[]
             end
-            push!(passes, DimPass{T}(nd, Bi, Bo, stages, bstages, nothing, Any[]))
+            push!(passes, DimPass{T}(nd, Bi, Bo, stages, bstages, nothing))
         else
-            # pencils ≥ nt run parallel on serial clones; fewer pencils run a
-            # serial loop over the primary plan (threaded internally)
-            fbs = Any[]
-            if nt > 1 && Bi * Bo ≥ nt
-                for _ in 1:nt
-                    push!(fbs, _bluestein(T, nd, D, one(T); nthreads=1))
-                end
-            end
+            # dim 1 runs transposed so the pencils become the lanes
             push!(passes, DimPass{T}(nd, Bi, Bo, Stage{T}[], Stage{T}[],
-                                     _bluestein(T, nd, D, one(T); nthreads), fbs))
-            maxfb = max(maxfb, nd)
+                                     _rs_pass(T, nd, D, Bi == 1 ? Bo : Bi)))
         end
     end
     fuse_in = false
@@ -110,12 +96,9 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
             fuse_in = false
         end
     end
-    npb = any(!isempty(p.fallbacks) for p in passes) ? nt : 1
     return NdPlan{T,D,N}(dims, len, passes,
                          Vector{T}(undef, len), Vector{T}(undef, len),
                          Vector{T}(undef, len), Vector{T}(undef, len),
-                         [Vector{Complex{T}}(undef, maxfb) for _ in 1:npb],
-                         [Vector{Complex{T}}(undef, maxfb) for _ in 1:npb],
                          fuse_in, fuse_out, dim1_batched, nt, scale)
 end
 
@@ -134,46 +117,19 @@ function transpose_planes!(ore, oim, cre, cim, R::Int, C::Int, nt::Int=1)
     return ore, oim, cre, cim
 end
 
-# pencils trange (1-based) of one fallback pass: gather -> 1-D plan -> scatter,
-# in place at the split-plane level
-function _fallback_range!(cre::Vector{T}, cim::Vector{T}, pass::DimPass{T}, fb,
-                          buf::Vector{Complex{T}}, buf2::Vector{Complex{T}},
-                          tlo::Int, thi::Int) where {T}
-    nd, Bi = pass.nd, pass.Bi
-    bv = view(buf, 1:nd)
-    bv2 = view(buf2, 1:nd)
-    @inbounds for t in tlo-1:thi-1
-        o, i = divrem(t, Bi)
-        base = o * Bi * nd + i + 1
-        for k in 0:nd-1
-            bv[k+1] = Complex(cre[base+Bi*k], cim[base+Bi*k])
-        end
-        fb(bv2, bv)
-        for k in 0:nd-1
-            z = bv2[k+1]
-            cre[base+Bi*k] = real(z)
-            cim[base+Bi*k] = imag(z)
-        end
-    end
-    return nothing
-end
-
-# per-pencil fallback pass: parallel over pencils when there are enough of
-# them (each chunk on its own serial clone + scratch), else a serial loop over
-# the primary plan, which threads its own inner transforms
-function _fallback_pass!(cre::Vector{T}, cim::Vector{T}, pass::DimPass{T},
-                         pbufs::Vector{Vector{Complex{T}}},
-                         pbufs2::Vector{Vector{Complex{T}}}, nt::Int) where {T}
-    total = pass.Bo * pass.Bi
-    if nt > 1 && !isempty(pass.fallbacks) && total ≥ nt
-        tforeach_chunks((ci, lo, hi) -> _fallback_range!(cre, cim, pass,
-                                                         pass.fallbacks[ci],
-                                                         pbufs[ci], pbufs2[ci],
-                                                         lo, hi),
-                        total, nt)
+# non-smooth dim: batched resampling in place on the current planes; dim 1
+# transposes through the other planes so its pencils become the lanes
+function _rs_pass!(cre::Vector{T}, cim::Vector{T}, ore::Vector{T}, oim::Vector{T},
+                   pass::DimPass{T}, q::RsPass{T}, d::Val) where {T}
+    nd, Bi, Bo = pass.nd, pass.Bi, pass.Bo
+    if Bi == 1 && Bo > 1
+        transpose_planes!(ore, oim, cre, cim, nd, Bo)
+        _rs_block!(q, ore, oim, 0, d)
+        transpose_planes!(cre, cim, ore, oim, Bo, nd)
     else
-        _fallback_range!(cre, cim, pass, pass.fallback, pbufs[1], pbufs2[1],
-                         1, total)
+        for o in 0:Bo-1
+            _rs_block!(q, cre, cim, o * Bi * nd, d)
+        end
     end
     return nothing
 end
@@ -300,8 +256,9 @@ function _nd_core!(p::NdPlan{T,D,N}, y, py::Ptr{T}, cre, cim, ore, oim,
     @inbounds begin
         for (pi, pass) in enumerate(p.passes)
             pi == 1 && skip1 && continue
-            if pass.fallback !== nothing
-                _fallback_pass!(cre, cim, pass, p.pbufs, p.pbufs2, nt)
+            fb = pass.fallback
+            if fb !== nothing
+                _rs_pass!(cre, cim, ore, oim, pass, fb, Val(D))
                 continue
             end
             from = pi == 1 ? stagestart : 1
