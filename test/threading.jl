@@ -17,10 +17,11 @@ serial_like(p::FFTJ.FFTPlan{T,D}) where {T,D} =
     FFTJ._plan(T, p.n, D, p.scale; nthreads=1)
 serial_like(p::FFTJ.SixStepPlan{T,D}) where {T,D} =
     FFTJ._sixstep(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::Union{FFTJ.FourStepPlan,FFTJ.ResamplePlan,FFTJ.CompositePlan}) = p
+serial_like(p::Union{FFTJ.FourStepPlan,FFTJ.ResamplePlan,FFTJ.CompositePlan,
+                     FFTJ.HvdhPlan}) = p
 
 # plan types with no threaded execution yet
-serial_only(p) = p isa Union{FFTJ.ResamplePlan,FFTJ.CompositePlan} ||
+serial_only(p) = p isa Union{FFTJ.ResamplePlan,FFTJ.CompositePlan,FFTJ.HvdhPlan} ||
                  (p isa Union{FFTJ.RfftPlan,FFTJ.IrfftPlan} && serial_only(p.inner))
 function serial_like(p::FFTJ.RfftPlan{T}) where {T}
     inner = serial_like(p.inner)
@@ -74,7 +75,7 @@ end
     rng = Xoshiro(0x7472)
     # 2^20: fused radix-4 chain; 2^19: radix-8 last stage; 3·2^18: radix-3
     # stage; 3^4·5·7·2^10: all odd radices; 1441440: radix-11/13 stages;
-    # 2^22 and 3·2^21: six-step; 1000003: prime → resampling (serial)
+    # 2^22 and 3·2^21: six-step; 1000003: prime → HvdH (serial)
     ns = [2^20, 2^19, 3 * 2^18, 3^4 * 5 * 7 * 2^10, 1441440, 2^22, 3 * 2^21,
           1000003]
     @testset "n = $n" for n in ns
@@ -151,7 +152,7 @@ end
 @testset "threaded real transforms vs serial ($T)" for T in (Float32, Float64)
     rng = Xoshiro(0x5ea1)
     # 2^20: even, half-complex fast path; 3·2^19: even mixed-radix half;
-    # 1000003: odd → full-length complex resampling fallback (serial)
+    # 1000003: odd → full-length complex HvdH fallback (serial)
     @testset "1-D n = $n" for n in (2^20, 3 * 2^19, 1000003)
         x = randn(rng, T, n)
         pr1 = plan_rfft(T, n; nthreads=1)

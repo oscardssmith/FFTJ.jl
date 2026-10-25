@@ -6,7 +6,7 @@
 # (fftshift, fftfreq, ...), which are re-exported.
 
 const AnyPlan{T} = Union{FFTPlan{T},FourStepPlan{T},SixStepPlan{T},ResamplePlan{T},
-                         CompositePlan{T}}
+                         CompositePlan{T},HvdhPlan{T}}
 
 # In-place complex plans. Execution is alias-safe (the input is fully consumed
 # into scratch before the output is written), so these wrap ordinary plans.
@@ -61,12 +61,13 @@ Base.size(ip::InplacePlan) = size(ip.p)
 
 _dir(::FFTPlan{T,D}) where {T,D} = D
 # serial-only plan types
-plan_nt(::Union{FourStepPlan,ResamplePlan,CompositePlan}) = 1
+plan_nt(::Union{FourStepPlan,ResamplePlan,CompositePlan,HvdhPlan}) = 1
 
 _dir(::FourStepPlan{T,D}) where {T,D} = D
 _dir(::SixStepPlan{T,D}) where {T,D} = D
 _dir(::ResamplePlan{T,D}) where {T,D} = D
 _dir(::CompositePlan{T,D}) where {T,D} = D
+_dir(::HvdhPlan{T,D}) where {T,D} = D
 
 # inv: forward ↦ scaled unnormalized backward (so inv(p).p is unnormalized,
 # matching DSP's inv(plan_fft!(x)).p idiom); normalized inverse ↦ plain

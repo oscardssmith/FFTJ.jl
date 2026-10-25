@@ -23,6 +23,7 @@ include("ndplan.jl")
 include("fourstep.jl")
 include("sixstep.jl")
 include("composite.jl")
+include("hvdh.jl")
 include("api.jl")
 
 end # module

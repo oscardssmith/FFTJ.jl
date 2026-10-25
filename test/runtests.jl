@@ -58,8 +58,8 @@ end
     rng = Xoshiro(0xb1e)
     # includes one past the weight-table cap, and (F32 only) slow-smooth
     # lengths with a small 2-part
-    ns = [17, 19, 23, 34, 38, 51, 97, 101, 289, 331, 361, 997, 1025, 1234,
-          2049, 10007, 65537]
+    ns = [17, 19, 23, 34, 38, 51, 97, 101, 289, 331, 361, 997, 1026, 1234,
+          2050, 10006, 65542]
     T == Float32 && append!(ns, [3^7, 5^4 * 2, 3^4 * 5^2])
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
@@ -77,6 +77,36 @@ end
         p(y2, x)
         @test (@allocated p(y2, x)) == 0
     end
+end
+
+@testset "HvdH resampling vs FFTW ($T)" for T in (Float32, Float64)
+    rng = Xoshiro(0x4d4)
+    # tiny and even lengths (reachable only directly), halos wider than t,
+    # and lengths routed here
+    ns = [11, 13, 17, 19, 22, 23, 26, 34, 38, 46, 97, 101, 202, 331, 997, 1001,
+          3107, 10007, 20011, 65537]
+    @testset "n = $n" for n in ns
+        x = randn(rng, Complex{T}, n)
+        ref = FFTW.fft(ComplexF64.(x))
+        p = FFTJ._hvdh(T, n, -1)
+        y = p(x)
+        @test norm(y .- ref) ≤ 50 * eps(T) * norm(ref)
+        @test FFTJ._hvdh(T, n, -1; factors=:fly)(x) ≈ y
+        pinv = FFTJ._hvdh(T, n, +1)
+        @test norm(pinv(y) .- x) ≤ 50 * eps(T) * norm(x)
+        y2 = similar(x)
+        p(y2, x)
+        @test (@allocated p(y2, x)) == 0
+        FFTJ.factor_radices(n) === nothing &&
+            @test plan_fft(T, n) isa (FFTJ._use_hvdh(T, n) && !FFTJ._use_composite(T, n) ?
+                                      FFTJ.HvdhPlan : Union{FFTJ.ResamplePlan,FFTJ.CompositePlan})
+    end
+    # even multiples of 30 have no coprime smooth t
+    @test_throws ArgumentError FFTJ._hvdh(T, 390, -1)
+    @test plan_bfft(T, 20011) isa FFTJ.HvdhPlan
+    xb = randn(rng, Complex{T}, 20011)
+    @test norm(plan_bfft(T, 20011)(plan_fft(T, 20011)(xb)) .- 20011 .* xb) ≤
+          50 * eps(T) * 20011 * norm(xb)
 end
 
 @testset "composite (smooth × non-smooth n) vs FFTW ($T)" for T in (Float32, Float64)
@@ -300,8 +330,9 @@ end
     for n in (405, 2835, 3^8, 3^12, 2 * 3^6 * 5^2 * 7^2, 11 * 1024, 13^3)
         @test plan_fft(Float64, n) isa FFTJ.FFTPlan
     end
-    # non-smooth routes to resampling
-    @test plan_fft(Float64, 10007) isa FFTJ.ResamplePlan
+    # non-smooth routes to resampling (large odd n: HvdH)
+    @test plan_fft(Float64, 10006) isa FFTJ.ResamplePlan
+    @test plan_fft(Float64, 10007) isa FFTJ.HvdhPlan
     @test plan_fft(Float32, 10007) isa FFTJ.ResamplePlan
     # Float32: small odd-heavy sizes resample, larger ones run direct
     @test plan_fft(Float32, 729) isa FFTJ.ResamplePlan
