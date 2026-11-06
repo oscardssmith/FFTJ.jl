@@ -176,6 +176,7 @@ function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
     if factor_radices(n) === nothing
         _use_composite(T, n) && return _composite(T, n, D, scale)
         _use_hvdh(T, n) && return _hvdh(T, n, D, scale)
+        _use_split(T, n) && return _split(T, n, D, scale)
         return _resample(T, n, D, scale)
     end
     _slow_smooth(T, n) && return _resample(T, n, D, scale)

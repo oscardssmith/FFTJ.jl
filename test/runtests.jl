@@ -64,19 +64,44 @@ end
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         ref = FFTW.fft(ComplexF64.(x))
-        p = plan_fft(T, n)
-        @test p isa FFTJ.ResamplePlan
+        # built directly: the larger even sizes route to SplitPlan
+        p = FFTJ._resample(T, n, -1)
+        FFTJ._use_split(T, n) || @test plan_fft(T, n) isa FFTJ.ResamplePlan
         y = p(x)
         @test norm(y .- ref) ≤ 100 * eps(T) * norm(ref)
-        pinv = plan_ifft(T, n)
+        pinv = FFTJ._resample(T, n, +1)
         @test norm(pinv(y) .- x) ≤ 100 * eps(T) * norm(x)
-        pb = plan_bfft(T, n)
+        pb = FFTJ._resample(T, n, +1, one(T))
         @test norm(pb(y) .- n .* x) ≤ 100 * eps(T) * n * norm(x)
         y2 = similar(x)
         p(y2, x)
         p(y2, x)
         @test (@allocated p(y2, x)) == 0
     end
+end
+
+@testset "split (small smooth × odd non-smooth n) vs FFTW ($T)" for T in (Float32, Float64)
+    rng = Xoshiro(0x5b1)
+    # s = 2..14 (radix-2/3/4/7 combine chains); the first few are below the
+    # routing thresholds and are built directly
+    ns = [2 * 1009, 6 * 1009, 14 * 1009, 2 * 10007, 4 * 10007, 12 * 2003,
+          2 * 32771, 8 * 16411]
+    @testset "n = $n" for n in ns
+        x = randn(rng, Complex{T}, n)
+        ref = FFTW.fft(ComplexF64.(x))
+        p = FFTJ._split(T, n, -1)
+        FFTJ._use_split(T, n) && @test plan_fft(T, n) isa FFTJ.SplitPlan
+        y = p(x)
+        @test norm(y .- ref) ≤ 100 * eps(T) * norm(ref)
+        pinv = FFTJ._split(T, n, +1)
+        @test norm(pinv(y) .- x) ≤ 100 * eps(T) * norm(x)
+        pb = FFTJ._split(T, n, +1, one(T))
+        @test norm(pb(y) .- n .* x) ≤ 100 * eps(T) * n * norm(x)
+        y2 = similar(x)
+        p(y2, x)
+        @test (@allocated p(y2, x)) == 0
+    end
+    @test any(n -> FFTJ._use_split(T, n), ns)
 end
 
 @testset "HvdH resampling vs FFTW ($T)" for T in (Float32, Float64)

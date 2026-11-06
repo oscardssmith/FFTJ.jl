@@ -17,10 +17,11 @@ serial_like(p::FFTJ.FFTPlan{T,D}) where {T,D} =
     FFTJ._plan(T, p.n, D, p.scale; nthreads=1)
 serial_like(p::FFTJ.FourStepPlan{T,D}) where {T,D} =
     FFTJ._fourstep(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::Union{FFTJ.ResamplePlan,FFTJ.CompositePlan,FFTJ.HvdhPlan}) = p
+serial_like(p::Union{FFTJ.ResamplePlan,FFTJ.CompositePlan,FFTJ.HvdhPlan,FFTJ.SplitPlan}) = p
 
 # plan types with no threaded execution yet
-serial_only(p) = p isa Union{FFTJ.ResamplePlan,FFTJ.CompositePlan,FFTJ.HvdhPlan} ||
+serial_only(p) = p isa Union{FFTJ.ResamplePlan,FFTJ.CompositePlan,FFTJ.HvdhPlan,
+                             FFTJ.SplitPlan} ||
                  (p isa Union{FFTJ.RfftPlan,FFTJ.IrfftPlan} && serial_only(p.inner))
 function serial_like(p::FFTJ.RfftPlan{T}) where {T}
     inner = serial_like(p.inner)

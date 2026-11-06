@@ -57,7 +57,9 @@ Pipeline for a 1-D transform of length n:
 - **n with larger prime factors** (or small odd-heavy Float32 sizes, see
   `_slow_smooth`): a large smooth factor × a non-smooth one runs as
   `CompositePlan` (composite.jl); odd n ≥ ~1k (F64) / ~16k (F32) as
-  Harvey–van der Hoeven Gaussian resampling (`HvdhPlan`, hvdh.jl); the rest
+  Harvey–van der Hoeven Gaussian resampling (`HvdhPlan`, hvdh.jl); even n
+  with a small smooth part (s < 16) as s single-lane HvdH transforms of the
+  odd cofactor plus a radix-s combine (`SplitPlan`, composite.jl); the rest
   as oversampled interpolation onto a smooth length (`ResamplePlan`,
   resample.jl). These are serial for now (`plan_nt == 1`).
 - **real transforms** (real.jl): even n packs input as n/2 complex points via
