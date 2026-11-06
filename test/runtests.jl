@@ -85,14 +85,15 @@ end
     # s = 2..14 (radix-2/3/4/7 combine chains); the first few are below the
     # routing thresholds and are built directly
     ns = [2 * 1009, 6 * 1009, 14 * 1009, 2 * 10007, 4 * 10007, 12 * 2003,
-          2 * 32771, 8 * 16411]
+          2 * 32771, 8 * 16411, 2 * 65537]
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         ref = FFTW.fft(ComplexF64.(x))
-        p = FFTJ._split(T, n, -1)
+        p = FFTJ._split(T, n, -1; nthreads=1)
         FFTJ._use_split(T, n) && @test plan_fft(T, n) isa FFTJ.SplitPlan
         y = p(x)
         @test norm(y .- ref) ≤ 100 * eps(T) * norm(ref)
+        @test FFTJ._split(T, n, -1; nthreads=4)(x) == y   # threaded sub-transforms
         pinv = FFTJ._split(T, n, +1)
         @test norm(pinv(y) .- x) ≤ 100 * eps(T) * norm(x)
         pb = FFTJ._split(T, n, +1, one(T))
@@ -113,10 +114,14 @@ end
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         ref = FFTW.fft(ComplexF64.(x))
-        p = FFTJ._hvdh(T, n, -1)
+        p = FFTJ._hvdh(T, n, -1; nthreads=1)
         y = p(x)
         @test norm(y .- ref) ≤ 50 * eps(T) * norm(ref)
         @test FFTJ._hvdh(T, n, -1; factors=:fly)(x) ≈ y
+        # threaded (from 65537 at 4 tasks) is bitwise serial, both factor modes
+        @test FFTJ._hvdh(T, n, -1; nthreads=4)(x) == y
+        @test FFTJ._hvdh(T, n, -1; factors=:fly, nthreads=4)(x) ==
+              FFTJ._hvdh(T, n, -1; factors=:fly, nthreads=1)(x)
         pinv = FFTJ._hvdh(T, n, +1)
         @test norm(pinv(y) .- x) ≤ 50 * eps(T) * norm(x)
         y2 = similar(x)

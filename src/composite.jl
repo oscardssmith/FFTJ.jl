@@ -132,8 +132,8 @@ function _use_split(::Type{T}, n::Int) where {T}
            n ≥ (sizeof(T) ≥ 8 ? 16384 : 65536)
 end
 
-function _split(::Type{T}, n::Int, D::Int,
-                scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
+function _split(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
+                nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     s = _smooth_part(n)
     p = n ÷ s
     Tw = promote_type(T, Float64)
@@ -155,7 +155,9 @@ function _split(::Type{T}, n::Int, D::Int,
         si, co = sincospi(Tw(2 * D * (r * l)) / n)
         lvr[W*r+l+1] = T(co); lvi[W*r+l+1] = T(si)
     end
-    hv = _hvdh(T, p, D, one(T))
+    # threads inside each sub-transform; the decimate/twiddle/combine passes
+    # are O(n) and stay serial
+    hv = _hvdh(T, p, D, one(T); nthreads)
     stages, _ = build_stages_cached(T, s, D; allow_small=false)
     return SplitPlan{T,D,typeof(hv)}(n, p, s, hv, stages, K, hir, hii, lor, loi, lvr, lvi,
                                      Vector{Complex{T}}(undef, n), Vector{Complex{T}}(undef, p),
@@ -182,6 +184,8 @@ function (q::SplitPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
 end
 
 (q::SplitPlan{T})(x::Vector{Complex{T}}) where {T} = q(similar(x), x)
+
+plan_nt(q::SplitPlan) = plan_nt(q.hv)
 
 # planes at o + k1 ← ω^{r·k1}·ys[k1], per W-lane window as
 # ω^{r·k1₀}·ω^{r·l}; windows may overlap (out of place)

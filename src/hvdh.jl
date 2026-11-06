@@ -18,6 +18,15 @@
 # so the transform's output q is (F_t S u)_{Δq} and each chunk reads its rows
 # sequentially.
 
+# one group solve's scratch (each task owns one)
+struct HvdhScratch{T}
+    yr::Vector{T}           # (R + 2B)·K: right-hand side, then solution
+    yi::Vector{T}
+    uf::Vector{T}           # (R + B)·(B+1)·K: 1/U_ii, U_{i,i+1..i+B}
+    ob::Vector{Int}         # R·K: output index of each row (-1: identity row)
+    ring::Vector{T}         # 8·3·K: A', G, 1/G of the columns in reach
+end
+
 struct HvdhPlan{T,D,w,K,B,P}
     n::Int
     t::Int
@@ -40,16 +49,15 @@ struct HvdhPlan{T,D,w,K,B,P}
     uim::Vector{T}
     v::Vector{T}            # 2t, interleaved: spread input, permuted
     Y::Vector{T}            # 2t, interleaved: its transform, row q holds (F_t S u)_{Δq}
-    yr::Vector{T}           # (R + 2B)·K: right-hand side, then solution
-    yi::Vector{T}
-    uf::Vector{T}           # (R + B)·(B+1)·K: 1/U_ii, U_{i,i+1..i+B}
-    ob::Vector{Int}         # R·K: output index of each row (-1: identity row)
-    ring::Vector{T}         # 8·3·K: A', G, 1/G of the columns in reach
+    ws::Vector{HvdhScratch{T}}   # per-task solve scratch
     lt::Vector{T}           # precomputed factors (empty: built per call): per group,
     ut::Vector{T}           # multipliers (R·B·K), uf's rows ((R+B)·(B+1)·K)
     ot::Vector{Int}         # and ob (R·K)
+    nt::Int
     scale::T
 end
+
+plan_nt(p::HvdhPlan) = p.nt
 
 # spreading width α: the smallest that gives band 2, which pays for its extra
 # taps (F64: 12, F32: 6) with a halved halo; larger α measured no faster
@@ -146,7 +154,7 @@ end
 function _hvdh(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                K::Int=pick_width(T), reseed::Int=_HVDH_RESEED, Lt::Int=_HVDH_LTARGET,
                sreseed::Int=_HVDH_SRESEED, α::Real=_hvdh_α(T),
-               factors::Symbol=:auto) where {T<:AbstractFloat}
+               factors::Symbol=:auto, nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     ispow2(reseed) || throw(ArgumentError("reseed must be a power of two (got $reseed)"))
     ispow2(sreseed) || throw(ArgumentError("sreseed must be a power of two (got $sreseed)"))
     t = _hvdh_t(n)
@@ -173,11 +181,18 @@ function _hvdh(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
         sx[c+1] = q0
         so[c+1] = Int(mod(widemul(Δ, last(_hvdh_e(n, t, q0))), n))
     end
-    pt = _anyplan(T, t, D, one(T); nthreads=1)
-    uf = zeros(T, (R + B) * (B + 1) * K)
-    for i in 0:B-1, lane in 1:K   # leading pad rows: identity
-        uf[i*(B+1)*K+lane] = one(T)
+    nt = plan_tasks(n, nthreads)
+    pt = _anyplan(T, t, D, one(T); nthreads=nt)
+    function scratch()
+        uf = zeros(T, (R + B) * (B + 1) * K)
+        for i in 0:B-1, lane in 1:K   # leading pad rows: identity
+            uf[i*(B+1)*K+lane] = one(T)
+        end
+        return HvdhScratch{T}(zeros(T, (R + 2B) * K), zeros(T, (R + 2B) * K), uf,
+                              Vector{Int}(undef, R * K), zeros(T, 8 * 3 * K))
     end
+    ws = [scratch() for _ in 1:min(nt, G)]
+    uf = ws[1].uf
     δ = Tw(Δ) / n
     rc = T.((exp(2a), exp(-2a), exp(-a), exp(2a * δ), exp(-2a * δ), exp(-a * δ^2),
              exp(-2a * δ^2)))
@@ -188,17 +203,17 @@ function _hvdh(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
     p = HvdhPlan{T,D,w,K,B,typeof(pt)}(
         n, t, Δ, H, L, G, T(a), Float64(α), rc, reseed - 1, sreseed, pt, T[exp(-a * d^2) for d in 1:B],
         se, sx, so, Vector{T}(undef, n + Δ + pick_width(T)), Vector{T}(undef, n + Δ + pick_width(T)),
-        Vector{T}(undef, 2t), zeros(T, 2t),
-        zeros(T, (R + 2B) * K), zeros(T, (R + 2B) * K), uf, Vector{Int}(undef, R * K), zeros(T, 8 * 3 * K),
+        Vector{T}(undef, 2t), zeros(T, 2t), ws,
         Vector{T}(undef, tab ? G * R * B * K : 0), Vector{T}(undef, tab ? G * length(uf) : 0),
-        Vector{Int}(undef, tab ? G * R * K : 0), scale)
+        Vector{Int}(undef, tab ? G * R * K : 0), nt, scale)
     if tab
         lf = Vector{T}(undef, R * B * K)
+        sc = ws[1]
         for g in 0:G-1
-            _hvdh_factor!(p, g, lf, uf, p.ob)
+            _hvdh_factor!(p, sc, g, lf, uf, sc.ob)
             copyto!(p.lt, g * length(lf) + 1, lf, 1, length(lf))
             copyto!(p.ut, g * length(uf) + 1, uf, 1, length(uf))
-            copyto!(p.ot, g * R * K + 1, p.ob, 1, R * K)
+            copyto!(p.ot, g * R * K + 1, sc.ob, 1, R * K)
         end
     end
     return p
@@ -208,17 +223,29 @@ function (p::HvdhPlan{T,D,w})(y::CVec{T}, x::CVec{T}) where {T,D,w}
     n = p.n
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
-    _hvdh_scatter!(p.ure, p.uim, x, n, p.Δ)
-    _hvdh_spread!(p.v, p.ure, p.uim, n, p.t, p.Δ, Val(w), p.α, p.srs)
+    nt = p.nt
+    _hvdh_scatter!(p.ure, p.uim, x, n, p.Δ, nt)
+    _hvdh_spread!(p.v, p.ure, p.uim, n, p.t, p.Δ, Val(w), p.α, p.srs, nt)
     p.p(reinterpret(Complex{T}, p.Y), reinterpret(Complex{T}, p.v))
     GC.@preserve y begin
         py = _rawptr(y)
-        tab = !isempty(p.lt)
-        for g in 0:p.G-1
-            tab ? _hvdh_subst!(p, py, g) : _hvdh_group!(p, py, g)
+        if nt > 1
+            # groups are independent; each task solves on its own scratch
+            tforeach_chunks((ci, lo, hi) -> _hvdh_groups!(p, p.ws[ci], py, lo - 1, hi - 1),
+                            p.G, nt)
+        else
+            _hvdh_groups!(p, p.ws[1], py, 0, p.G - 1)
         end
     end
     return y
+end
+
+function _hvdh_groups!(p::HvdhPlan{T}, sc::HvdhScratch{T}, py::Ptr{T}, glo::Int, ghi::Int) where {T}
+    tab = !isempty(p.lt)
+    for g in glo:ghi
+        tab ? _hvdh_subst!(p, sc, py, g) : _hvdh_group!(p, sc, py, g)
+    end
+    return nothing
 end
 
 (p::HvdhPlan{T})(x::Vector{Complex{T}}) where {T} = p(similar(x), x)
@@ -231,31 +258,20 @@ end
 # c = Δ⁻¹ mod n, so an S×S tile of (i, j) reads S runs of x along i and writes
 # S runs of y along j, transposed in registers; rows r ≥ ⌊n/Δ⌋Δ and the last
 # Δ mod S columns go singly.
-function _hvdh_scatter!(yr::Vector{T}, yi::Vector{T}, x, n, Δ) where {T}
+function _hvdh_scatter!(yr::Vector{T}, yi::Vector{T}, x, n, Δ, nt::Int=1) where {T}
     S = 8
     c = invmod(Δ, n)
     I = n ÷ Δ
     J8 = Δ - Δ % S
     wrap(l) = l - ifelse(l ≥ n, n, 0)
-    cS = mod(S * c, n)
-    bj = ntuple(j -> mod((j - 1) * c, n), Val(S))
     GC.@preserve x begin
         px = _rawptr(x)
-        @inbounds for jb in 0:S:J8-1
-            ls = bj
-            for ib in 0:S:I-1
-                rs = map(@inline(l -> _hvdh_ldc(px, x, l, n, Val(S))), ls)
-                re = vtranspose(map(first, rs))
-                im = vtranspose(map(last, rs))
-                for i in 1:S
-                    ib + i ≤ I || break
-                    r = (ib + i - 1) * Δ + jb + 1
-                    vstore(re[i], yr, r)
-                    vstore(im[i], yi, r)
-                end
-                ls = map(@inline(l -> wrap(l + S)), ls)
-            end
-            bj = map(@inline(l -> wrap(l + cS)), bj)
+        # S×S tiles, by column block; tiles write disjoint columns
+        if nt > 1
+            tforeach((lo, hi) -> _hvdh_tiles!(yr, yi, px, x, n, Δ, c, I, lo - 1, hi - 1),
+                     J8 ÷ S, nt)
+        else
+            _hvdh_tiles!(yr, yi, px, x, n, Δ, c, I, 0, J8 ÷ S - 1)
         end
         l0 = mod(J8 * c, n)
         @inbounds for j in J8:Δ-1     # leftover columns
@@ -281,6 +297,31 @@ function _hvdh_scatter!(yr::Vector{T}, yi::Vector{T}, x, n, Δ) where {T}
     return nothing
 end
 
+# column blocks blo..bhi of _hvdh_scatter!'s tiles; block b's first column
+# reads x from l = (bS + j)·c mod n, exactly as advancing from block 0
+function _hvdh_tiles!(yr::Vector{T}, yi::Vector{T}, px::Ptr{T}, x, n, Δ, c, I,
+                      blo::Int, bhi::Int) where {T}
+    S = 8
+    wrap(l) = l - ifelse(l ≥ n, n, 0)
+    @inbounds for b in blo:bhi
+        jb = S * b
+        ls = ntuple(j -> Int(mod(widemul(jb + j - 1, c), n)), Val(S))
+        for ib in 0:S:I-1
+            rs = map(@inline(l -> _hvdh_ldc(px, x, l, n, Val(S))), ls)
+            re = vtranspose(map(first, rs))
+            im = vtranspose(map(last, rs))
+            for i in 1:S
+                ib + i ≤ I || break
+                r = (ib + i - 1) * Δ + jb + 1
+                vstore(re[i], yr, r)
+                vstore(im[i], yi, r)
+            end
+            ls = map(@inline(l -> wrap(l + S)), ls)
+        end
+    end
+    return nothing
+end
+
 # x[l+1 : l+S] deinterleaved, cyclically
 @inline function _hvdh_ldc(px::Ptr{T}, x, l, n, ::Val{S}) where {T,S}
     if l + S ≤ n
@@ -299,25 +340,49 @@ end
 # multiplication, re-seeded exactly every rs vectors. y is padded by Δ + V,
 # so a row's taps never wrap.
 function _hvdh_spread!(v::Vector{T}, yr::Vector{T}, yi::Vector{T}, n, t, Δ,
-                       ::Val{w}, α, rs, ::Val{J}=Val(8)) where {T,w,J}
+                       ::Val{w}, α, rs, nt::Int=1, ::Val{J}=Val(8)) where {T,w,J}
     V = pick_width(T)
-    VT = Vec{V,T}
     hw = w ÷ 2
     b = π / Float64(α)^2
     θ = Δ / t
     κ = V / t
-    fE, fG, fGi, fH = T(exp(-2b * κ^2)), T(exp(-2b * κ)), T(exp(2b * κ)), T(exp(-2b * θ * κ))
+    fs = (T(exp(-2b * κ^2)), T(exp(-2b * κ)), T(exp(2b * κ)), T(exp(-2b * θ * κ)))
     kc = ntuple(i -> T(exp(-b * (i - hw)^2)), Val(w))    # tap o = i - hw
     gc = (ntuple(g -> T(exp(-b * ((g - 1) * θ)^2)), Val(J)),
           ntuple(g -> T(exp(-2b * (g - 1) * θ)), Val(J)),
           ntuple(g -> T(exp(2b * (g - 1) * θ)), Val(J)))
+    # work units: (row block, run of rs vectors along j); each unit starts on
+    # a re-seed, so any split reproduces the serial values exactly
+    nseg = cld(Δ, rs * V)
+    nu = cld(cld(t, Δ), J) * nseg
+    if nt > 1
+        tforeach((lo, hi) -> _hvdh_spread_units!(v, yr, yi, n, t, Δ, Val(w), α, rs, Val(J),
+                                                 b, θ, κ, fs, kc, gc, nseg, lo - 1, hi - 1),
+                 nu, nt)
+    else
+        _hvdh_spread_units!(v, yr, yi, n, t, Δ, Val(w), α, rs, Val(J),
+                            b, θ, κ, fs, kc, gc, nseg, 0, nu - 1)
+    end
+    return nothing
+end
+
+function _hvdh_spread_units!(v::Vector{T}, yr::Vector{T}, yi::Vector{T}, n, t, Δ,
+                             ::Val{w}, α, rs, ::Val{J}, b, θ, κ, (fE, fG, fGi, fH), kc, gc,
+                             nseg, ulo, uhi) where {T,w,J}
+    V = pick_width(T)
+    VT = Vec{V,T}
+    hw = w ÷ 2
     js = Vec{V,Int}(ntuple(j -> j - 1, Val(V)))
-    @inbounds for i0 in 0:J:cld(t, Δ)-1
+    @inbounds for u in ulo:uhi
+        ib, seg = divrem(u, nseg)
+        i0 = J * ib
         bs = ntuple(m -> mod((i0 + m - 1 - hw) * Δ, n) + 1, Val(J + w - 1))
         lim = ntuple(g -> clamp(t - (i0 + g - 1) * Δ, 0, Δ), Val(J))
         E = G = Gi = R = H = zero(VT)
-        j = blk = 0
-        while j < Δ
+        j = seg * rs * V
+        jend = min(Δ, j + rs * V)
+        blk = 0
+        while j < jend
             if blk & (rs - 1) == 0
                 δ = convert(VT, (t - i0 * Δ - j) - js) * T(1 / t)
                 E = _vexp(-T(b) * δ * δ) * T(1 / α)
@@ -428,12 +493,12 @@ end
 
 # prime the column ring with group g's columns -B .. B-1 (relative to row 0);
 # returns the column state after them
-@inline function _hvdh_prime!(p::HvdhPlan{T,D,w,K,B}, g) where {T,D,w,K,B}
+@inline function _hvdh_prime!(p::HvdhPlan{T,D,w,K,B}, ring, g) where {T,D,w,K,B}
     n, Δ = p.n, p.Δ
     e = @inbounds vload(Vec{K,Int}, p.se, g * K + 1)
     cs = _hvdh_seed(e, n, p.a, T(Δ / n))
     for c in -B:B-1
-        _hvdh_col!(p.ring, c & 7, e, cs, n)
+        _hvdh_col!(ring, c & 7, e, cs, n)
         e, cs = _hvdh_step(e, cs, p.rc, n, Δ)
     end
     return e, cs
@@ -443,8 +508,8 @@ end
 # i-B .. i-1 of uf, with its U row stored to uf; returns the advanced column
 # state and next output index on, row i's output index (-1: identity row),
 # and the multipliers f[k] of rows i-k
-@inline function _hvdh_row!(p::HvdhPlan{T,D,w,K,B}, i, e, cs, on, uf, ch) where {T,D,w,K,B}
-    n, Δ, ring = p.n, p.Δ, p.ring
+@inline function _hvdh_row!(p::HvdhPlan{T,D,w,K,B}, ring, i, e, cs, on, uf, ch) where {T,D,w,K,B}
+    n, Δ = p.n, p.Δ
     VT = Vec{K,T}
     S = B + 1   # uf row stride, in vectors
     @inbounds begin
@@ -490,17 +555,18 @@ end
 # one group of K chunks, factoring as it goes: each row is built and
 # eliminated while its right-hand side is gathered and reduced (the two
 # overlap), then the back pass
-function _hvdh_group!(p::HvdhPlan{T,D,w,K,B}, py::Ptr{T}, g::Int) where {T,D,w,K,B}
+function _hvdh_group!(p::HvdhPlan{T,D,w,K,B}, sc::HvdhScratch{T}, py::Ptr{T},
+                      g::Int) where {T,D,w,K,B}
     t, R = p.t, p.L + 2p.H
     VT, VI = Vec{K,T}, Vec{K,Int}
-    yr, yi, ob, Y = p.yr, p.yi, p.ob, p.Y
+    yr, yi, ob, uf, ring, Y = sc.yr, sc.yi, sc.ob, sc.uf, sc.ring, p.Y
     ch = ntuple(d -> p.ch[d], Val(B))
-    e, cs = _hvdh_prime!(p, g)
+    e, cs = _hvdh_prime!(p, ring, g)
     @inbounds begin
         idx = vload(VI, p.sx, g * K + 1)
         on = vload(VI, p.so, g * K + 1)
         for i in 0:R-1
-            e, cs, on, oq, f = _hvdh_row!(p, i, e, cs, on, p.uf, ch)
+            e, cs, on, oq, f = _hvdh_row!(p, ring, i, e, cs, on, uf, ch)
             vstore(oq, ob, i * K + 1)
             hit = oq ≥ 0
             ar = vifelse(hit, vgather(Y, 2idx + 1), zero(T))
@@ -516,18 +582,19 @@ function _hvdh_group!(p::HvdhPlan{T,D,w,K,B}, py::Ptr{T}, g::Int) where {T,D,w,K
             idx = vifelse(idx ≥ t, idx - t, idx)
         end
     end
-    _hvdh_back!(p, py, p.uf, 0, ob, 0)
+    _hvdh_back!(p, sc, py, uf, 0, ob, 0)
     return nothing
 end
 
 # back-substitute one group's rows from U (uf[uo+1 ...], row stride (B+1)·K)
 # and scatter the core rows to their outputs (ob[oo+1 ...], -1: none)
-@inline function _hvdh_back!(p::HvdhPlan{T,D,w,K,B}, py::Ptr{T}, uf, uo, ob, oo) where {T,D,w,K,B}
+@inline function _hvdh_back!(p::HvdhPlan{T,D,w,K,B}, sc::HvdhScratch{T}, py::Ptr{T},
+                             uf, uo, ob, oo) where {T,D,w,K,B}
     n, t, H, L = p.n, p.t, p.H, p.L
     R = L + 2H
     VT, VI = Vec{K,T}, Vec{K,Int}
     sz = sizeof(T)
-    yr, yi = p.yr, p.yi
+    yr, yi = sc.yr, sc.yi
     S = B + 1
     sc = p.scale * T(n) / t
     @inbounds for i in R-1:-1:H
@@ -557,14 +624,15 @@ end
 
 # factor group g's band without data (for the tables): multipliers to lf,
 # 1/U_ii and U_{i,i+1..i+B} to uf, each row's output index (-1: none) to ob
-function _hvdh_factor!(p::HvdhPlan{T,D,w,K,B}, g::Int, lf, uf, ob) where {T,D,w,K,B}
+function _hvdh_factor!(p::HvdhPlan{T,D,w,K,B}, sc::HvdhScratch{T}, g::Int,
+                       lf, uf, ob) where {T,D,w,K,B}
     R = p.L + 2p.H
     ch = ntuple(d -> p.ch[d], Val(B))
-    e, cs = _hvdh_prime!(p, g)
+    e, cs = _hvdh_prime!(p, sc.ring, g)
     @inbounds begin
         on = vload(Vec{K,Int}, p.so, g * K + 1)
         for i in 0:R-1
-            e, cs, on, oq, f = _hvdh_row!(p, i, e, cs, on, uf, ch)
+            e, cs, on, oq, f = _hvdh_row!(p, sc.ring, i, e, cs, on, uf, ch)
             vstore(oq, ob, i * K + 1)
             for k in 1:B
                 vstore(f[k], lf, (i * B + B - k) * K + 1)
@@ -576,10 +644,11 @@ end
 
 # one group from the precomputed tables: gather the rows, forward-substitute
 # with the multipliers, back pass
-function _hvdh_subst!(p::HvdhPlan{T,D,w,K,B}, py::Ptr{T}, g::Int) where {T,D,w,K,B}
+function _hvdh_subst!(p::HvdhPlan{T,D,w,K,B}, sc::HvdhScratch{T}, py::Ptr{T},
+                      g::Int) where {T,D,w,K,B}
     t, R = p.t, p.L + 2p.H
     VT, VI = Vec{K,T}, Vec{K,Int}
-    yr, yi, Y, lt, ot = p.yr, p.yi, p.Y, p.lt, p.ot
+    yr, yi, Y, lt, ot = sc.yr, sc.yi, p.Y, p.lt, p.ot
     lo, oo = g * R * B * K, g * R * K
     @inbounds begin
         idx = vload(VI, p.sx, g * K + 1)
@@ -599,7 +668,7 @@ function _hvdh_subst!(p::HvdhPlan{T,D,w,K,B}, py::Ptr{T}, g::Int) where {T,D,w,K
             idx = vifelse(idx ≥ t, idx - t, idx)
         end
     end
-    _hvdh_back!(p, py, p.ut, g * length(p.uf), ot, oo)
+    _hvdh_back!(p, sc, py, p.ut, g * length(sc.uf), ot, oo)
     return nothing
 end
 

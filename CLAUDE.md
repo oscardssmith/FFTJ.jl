@@ -61,7 +61,10 @@ Pipeline for a 1-D transform of length n:
   with a small smooth part (s < 16) as s single-lane HvdH transforms of the
   odd cofactor plus a radix-s combine (`SplitPlan`, composite.jl); the rest
   as oversampled interpolation onto a smooth length (`ResamplePlan`,
-  resample.jl). These are serial for now (`plan_nt == 1`).
+  resample.jl). HvdH threads its permute, spread (in units aligned to its
+  recurrence re-seeds), inner transform and group solves (per-task
+  `HvdhScratch`); `SplitPlan` threads inside its sub-transforms. Composite
+  and resample plans are serial (`plan_nt == 1`).
 - **real transforms** (real.jl): even n packs input as n/2 complex points via
   reinterpret (no copy) + O(n) even/odd split post-pass; odd n falls back to a
   full complex transform.
