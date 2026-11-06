@@ -12,7 +12,7 @@ struct CompositePlan{T,D}
     p::Int
     s::Int
     stages::Vector{Stage{T}}   # length-s chain, inner batch p
-    rs::RsPass{T}              # length-p resampling, s lanes
+    rs::Union{RsPass{T},HvPass{T}}   # length-p resampling, s lanes
     K::Int                     # two-level twiddles: ω^e = hi[e ÷ K]·lo[e % K]
     hir::Vector{T}
     hii::Vector{T}
@@ -33,6 +33,10 @@ end
 # per element than F64's, loses at 16k and wins at 40k)
 const _COMPOSITE_MIN_S = 16
 _composite_min_n(::Type{T}) where {T} = sizeof(T) ≥ 8 ? 4096 : 32768
+
+# smallest p whose pass is batched HvdH rather than oversampled interpolation:
+# measured parity from ~200 to ~2k (halo rows dominate tiny p), ~1.2× at 4k–10k
+const _COMPOSITE_HV_MINP = 500
 
 function _smooth_part(n::Int)
     s = 1
@@ -71,7 +75,8 @@ function _composite(::Type{T}, n::Int, D::Int,
         lvr[W*j1+l+1] = T(co); lvi[W*j1+l+1] = T(si)
     end
     stages, _ = build_stages_cached(T, s, D; allow_small=false)
-    return CompositePlan{T,D}(n, p, s, stages, _rs_pass(T, p, D, s), K,
+    rs = p ≥ _COMPOSITE_HV_MINP ? _hv_pass(T, p, D, s) : _rs_pass(T, p, D, s)
+    return CompositePlan{T,D}(n, p, s, stages, rs, K,
                               hir, hii, lor, loi, lvr, lvi,
                               Vector{T}(undef, n), Vector{T}(undef, n),
                               Vector{T}(undef, n), Vector{T}(undef, n), scale)

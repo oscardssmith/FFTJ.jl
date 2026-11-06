@@ -602,3 +602,218 @@ function _hvdh_subst!(p::HvdhPlan{T,D,w,K,B}, py::Ptr{T}, g::Int) where {T,D,w,K
     _hvdh_back!(p, py, p.ut, g * length(p.uf), ot, oo)
     return nothing
 end
+
+_hvdh_w(::HvdhPlan{T,D,w}) where {T,D,w} = w
+
+# Batched HvdH: length-n transforms of B lanes (row j, lane i at B·j + i), in
+# place, as RsPass. The lanes share the spread weights and the band, so the
+# weights are a table and the band is factored once, as one cyclic chunk with
+# scalar factors, while the lanes are the vector dimension. Spread output q's
+# taps are the w input rows from qc - hw (c = Δ⁻¹ mod n): _hvdh_spread!'s
+# y[(q + (o-1)Δ) mod n] with y[lΔ mod n] = u_l.
+struct HvPass{T}
+    n::Int
+    t::Int
+    w::Int
+    nb::Int                 # band
+    H::Int                  # halo rows per side
+    R::Int                  # chunk rows, t + 2H
+    B::Int                  # lanes per row
+    C::Int                  # lanes per chunk
+    wt::Vector{T}           # t·w spread weights
+    l0::Vector{Int}         # each spread output's first input row
+    cf::Vector{T}           # per chunk row: multipliers of rows i-nb .. i-1,
+                            # 1/U_ii, U_{i,i+1..i+nb}
+    oi::Vector{Int}         # per chunk row: output row (-1: identity row)
+    q0::Int                 # transform row of chunk row 0
+    sc::T                   # n/t
+    stages::Vector{Stage{T}}
+    ro::Vector{Int}         # w tap offsets, scratch
+    are::Vector{T}          # chunk scratch: input (n rows)
+    aim::Vector{T}
+    pre::Vector{T}          # spread and transform, then back-substitution
+    pim::Vector{T}          # (max(t, R + 2nb) rows)
+    qre::Vector{T}
+    qim::Vector{T}
+    zr::Vector{T}           # forward substitution (R + 2nb rows)
+    zi::Vector{T}
+end
+
+const _HV_PASS_CACHE = Dict{Tuple{DataType,Int,Int},Any}()
+
+function _hv_parts(::Type{T}, n::Int, D::Int) where {T}
+    sp = _hvdh(T, n, D, one(T); K=1, Lt=typemax(Int) ÷ 2, factors=:table)
+    t, Δ, H, w, nb = sp.t, sp.Δ, sp.H, _hvdh_w(sp), length(sp.ch)
+    R = sp.L + 2H
+    S = nb + 1
+    cf = Vector{T}(undef, R * (2nb + 1))
+    for i in 0:R-1
+        co = i * (2nb + 1)
+        copyto!(cf, co + 1, sp.lt, i * nb + 1, nb)
+        copyto!(cf, co + nb + 1, sp.ut, (i + nb) * S + 1, S)
+    end
+    Tw = promote_type(T, Float64)
+    α = Tw(sp.α)
+    b = π / α^2
+    hw = w ÷ 2
+    c = invmod(Δ, n)
+    wt = Vector{T}(undef, t * w)
+    l0 = Vector{Int}(undef, t)
+    for q in 0:t-1
+        δ = Tw(t - q) / t
+        for o in 1-hw:hw
+            wt[q*w+o+hw] = T(exp(-b * (δ - o)^2) / α)
+        end
+        l0[q+1] = mod(q * c - hw, n)
+    end
+    return t, w, nb, H, R, wt, l0, cf, copy(sp.ot), sp.sx[1], T(n / t)
+end
+
+function _hv_pass(::Type{T}, n::Int, D::Int, B::Int) where {T}
+    t, w, nb, H, R, wt, l0, cf, oi, q0, sc =
+        _cached(() -> _hv_parts(T, n, D), _HV_PASS_CACHE, (T, n, D))
+    W = pick_width(T)
+    M = max(t, R + 2nb)
+    C = B < 2W ? B : clamp(_RS_CHUNK_MAX ÷ (4 * M * sizeof(T)) ÷ W * W, W, B ÷ W * W)
+    cmax = B - (max(1, B ÷ C) - 1) * C   # the last chunk is the widest
+    stages, _ = build_stages_cached(T, t, D; allow_small=B == 1)
+    pl() = Vector{T}(undef, cmax * M)
+    return HvPass{T}(n, t, w, nb, H, R, B, C, wt, l0, cf, oi, q0, sc, stages,
+                     Vector{Int}(undef, w),
+                     Vector{T}(undef, cmax * n), Vector{T}(undef, cmax * n),
+                     pl(), pl(), pl(), pl(),
+                     zeros(T, cmax * (R + 2nb)), zeros(T, cmax * (R + 2nb)))
+end
+
+function _rs_block!(q::HvPass{T}, xre::Vector{T}, xim::Vector{T}, off::Int,
+                    d::Val, tw=nothing) where {T}
+    B, C = q.B, q.C
+    nc = max(1, B ÷ C)
+    for c in 0:nc-1
+        i0 = c * C
+        _hv_chunk!(q, xre, xim, off, i0, c == nc - 1 ? B - i0 : C, d, tw)
+    end
+    return nothing
+end
+
+function _hv_chunk!(q::HvPass{T}, xre::Vector{T}, xim::Vector{T}, off0::Int, i0::Int,
+                    L::Int, d::Val, tw) where {T}
+    n, t, w, nb, H, R, B = q.n, q.t, q.w, q.nb, q.H, q.R, q.B
+    off = off0 + i0
+    are, aim, ro, cf, oi = q.are, q.aim, q.ro, q.cf, q.oi
+    @inbounds for j in 0:n-1
+        if tw === nothing
+            _rows_scale!(are, aim, L * j, xre, xim, off + B * j, one(T), L)
+        else
+            _rows_scale_tw!(are, aim, L * j, xre, xim, off + B * j, one(T), L, tw, j, i0)
+        end
+    end
+    @inbounds for k in 0:t-1
+        r = q.l0[k+1]
+        for o in 1:w
+            ro[o] = L * r
+            r += 1
+            r = ifelse(r == n, 0, r)
+        end
+        _rows_spread!(q.pre, q.pim, L * k, are, aim, q.wt, w * k, ro, w, L)
+    end
+    rng = 1:L*t
+    gre, gim, sre, sim = run_chain!(view(q.pre, rng), view(q.pim, rng), view(q.qre, rng),
+                                    view(q.qim, rng), q.stages, t, 1, L, d)
+    gre, gim, xr, xi = parent(gre), parent(gim), parent(sre), parent(sim)
+    zr, zi = q.zr, q.zi
+    fill!(view(zr, 1:L*nb), zero(T))
+    fill!(view(zi, 1:L*nb), zero(T))
+    k = q.q0
+    @inbounds for i in 0:R-1      # forward substitution, rows i-nb .. i-1
+        _rows_fwd!(zr, zi, L * (i + nb), gre, gim, L * k, oi[i+1] ≥ 0, cf,
+                   i * (2nb + 1), nb, L)
+        k += 1
+        k = ifelse(k == t, 0, k)
+    end
+    fill!(view(xr, L*(R+nb)+1:L*(R+2nb)), zero(T))
+    fill!(view(xi, L*(R+nb)+1:L*(R+2nb)), zero(T))
+    @inbounds for i in R-1:-1:H   # back substitution into the spare planes
+        _rows_back!(xr, xi, zr, zi, L * (i + nb), cf, i * (2nb + 1) + nb, nb, L)
+        o = oi[i+1]
+        i < R - H && o ≥ 0 &&
+            _rows_scale!(xre, xim, off + B * o, xr, xi, L * (i + nb), q.sc, L)
+    end
+    return nothing
+end
+
+# f(z, i) over L lanes in windows of typeof(z) (a zero vector, as closures
+# don't specialize on a type argument), overlapping at the end, so only for
+# out-of-place work
+@inline function _hv_lanes(f::F, L, ::Type{T}) where {F,T}
+    W = pick_width(T)
+    if W > 1 && L ≥ W
+        for i in QWin(L, W)
+            f(zero(Vec{W,T}), i)
+        end
+    else
+        for i in 1:L
+            f(zero(Vec{1,T}), i)
+        end
+    end
+    return nothing
+end
+
+# y row at yo = Σ_o wt[wo + o] · x row at ro[o]
+@inline function _rows_spread!(yre, yim, yo, xre, xim, wt::Vector{T}, wo, ro, w, L) where {T}
+    _hv_lanes(L, T) do z, i
+        @inline
+        VT = typeof(z)
+        @inbounds begin
+            ar = ai = z
+            for o in 1:w
+                c = VT(wt[wo+o])
+                ar = muladd(c, vload(VT, xre, ro[o] + i), ar)
+                ai = muladd(c, vload(VT, xim, ro[o] + i), ai)
+            end
+            vstore(ar, yre, yo + i)
+            vstore(ai, yim, yo + i)
+        end
+    end
+end
+
+# z row at zo = (hit ? y row at yo : 0) - Σ_m cf[co + m] · z row nb + 1 - m back
+@inline function _rows_fwd!(zr, zi, zo, yre, yim, yo, hit, cf::Vector{T}, co, nb, L) where {T}
+    _hv_lanes(L, T) do z, i
+        @inline
+        VT = typeof(z)
+        @inbounds begin
+            ar = hit ? vload(VT, yre, yo + i) : z
+            ai = hit ? vload(VT, yim, yo + i) : z
+            for m in 1:nb
+                f = VT(cf[co+m])
+                zp = zo - L * (nb + 1 - m) + i
+                ar = muladd(-f, vload(VT, zr, zp), ar)
+                ai = muladd(-f, vload(VT, zi, zp), ai)
+            end
+            vstore(ar, zr, zo + i)
+            vstore(ai, zi, zo + i)
+        end
+    end
+end
+
+# x row at xo = (z row at xo - Σ_j U_j · x row j ahead) / U_ii, with
+# cf[co + 1] = 1/U_ii and cf[co + 1 + j] = U_j
+@inline function _rows_back!(xr, xi, zr, zi, xo, cf::Vector{T}, co, nb, L) where {T}
+    _hv_lanes(L, T) do z, i
+        @inline
+        VT = typeof(z)
+        @inbounds begin
+            ar = vload(VT, zr, xo + i)
+            ai = vload(VT, zi, xo + i)
+            for j in 1:nb
+                u = VT(cf[co+1+j])
+                ar = muladd(-u, vload(VT, xr, xo + L * j + i), ar)
+                ai = muladd(-u, vload(VT, xi, xo + L * j + i), ai)
+            end
+            iu = VT(cf[co+1])
+            vstore(ar * iu, xr, xo + i)
+            vstore(ai * iu, xi, xo + i)
+        end
+    end
+end
