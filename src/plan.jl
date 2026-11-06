@@ -168,9 +168,8 @@ function _slow_smooth(::Type{T}, n::Int) where {T}
 end
 
 # Routing: lengths without a fast chain are resampled (only their
-# non-smooth factor, when the smooth one is large enough). Large smooth
-# lengths run six-step when threaded and four-step when serial; the rest
-# run the stage chain directly.
+# non-smooth factor, when the smooth one is large enough); out-of-cache
+# smooth lengths run four-step; the rest run the stage chain directly.
 function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                   nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
@@ -180,11 +179,7 @@ function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
         return _resample(T, n, D, scale)
     end
     _slow_smooth(T, n) && return _resample(T, n, D, scale)
-    if plan_tasks(n, nthreads) > 1
-        n ≥ SIXSTEP_MIN && return _sixstep(T, n, D, scale; nthreads)
-    else
-        _use_fourstep(T, n) && return _fourstep(T, n, D, scale)
-    end
+    _use_fourstep(T, n) && return _fourstep(T, n, D, scale; nthreads)
     return _plan(T, n, D, scale; nthreads)
 end
 plan_fft(::Type{T}, n::Integer; nthreads::Integer=Threads.nthreads()) where {T<:AbstractFloat} =

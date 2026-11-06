@@ -140,17 +140,18 @@ end
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         ref = FFTW.fft(ComplexF64.(x))
-        # threaded plans route to direct or six-step instead
-        p = plan_fft(T, n; nthreads=1)
+        p = plan_fft(T, n; nthreads=4)
         @test p isa FFTJ.FourStepPlan
         y = p(x)
         @test norm(y .- ref) ≤ 50 * eps(T) * norm(ref)
-        pinv = plan_ifft(T, n; nthreads=1)
+        pinv = plan_ifft(T, n; nthreads=4)
         @test norm(pinv(y) .- x) ≤ 50 * eps(T) * norm(x)
+        # the serial plan of the same split is bitwise equal and alloc-free
+        p1 = FFTJ._fourstep(T, n, -1; nthreads=1)
         y2 = similar(x)
-        p(y2, x)
+        p1(y2, x)
         @test y2 == y
-        @test (@allocated p(y2, x)) == 0
+        @test (@allocated p1(y2, x)) == 0
     end
     # lopsided splits nest one pass's inner transform at a testable size
     W = FFTJ.pick_width(T)

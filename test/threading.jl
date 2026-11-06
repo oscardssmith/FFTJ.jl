@@ -15,10 +15,9 @@ end
 # four-step only pays when threaded.)
 serial_like(p::FFTJ.FFTPlan{T,D}) where {T,D} =
     FFTJ._plan(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::FFTJ.SixStepPlan{T,D}) where {T,D} =
-    FFTJ._sixstep(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::Union{FFTJ.FourStepPlan,FFTJ.ResamplePlan,FFTJ.CompositePlan,
-                     FFTJ.HvdhPlan}) = p
+serial_like(p::FFTJ.FourStepPlan{T,D}) where {T,D} =
+    FFTJ._fourstep(T, p.n, D, p.scale; nthreads=1)
+serial_like(p::Union{FFTJ.ResamplePlan,FFTJ.CompositePlan,FFTJ.HvdhPlan}) = p
 
 # plan types with no threaded execution yet
 serial_only(p) = p isa Union{FFTJ.ResamplePlan,FFTJ.CompositePlan,FFTJ.HvdhPlan} ||
@@ -73,9 +72,9 @@ end
 
 @testset "threaded 1-D complex vs serial ($T)" for T in (Float32, Float64)
     rng = Xoshiro(0x7472)
-    # 2^20: fused radix-4 chain; 2^19: radix-8 last stage; 3·2^18: radix-3
-    # stage; 3^4·5·7·2^10: all odd radices; 1441440: radix-11/13 stages;
-    # 2^22 and 3·2^21: six-step; 1000003: prime → HvdH (serial)
+    # direct chains: 2^20 fused radix-4; 2^19 radix-8 last stage; 3·2^18
+    # radix-3; 3^4·5·7·2^10 all odd radices; 1441440 radix-11/13 (the routed
+    # plan is four-step for most); 1000003: prime → HvdH (serial)
     ns = [2^20, 2^19, 3 * 2^18, 3^4 * 5 * 7 * 2^10, 1441440, 2^22, 3 * 2^21,
           1000003]
     @testset "n = $n" for n in ns
@@ -93,6 +92,9 @@ end
         ref = FFTW.fft(ComplexF64.(x))
         @test norm(yt .- ref) ≤ 100 * eps(T) * norm(ref)
         @test norm(p1(x) .- ref) ≤ 100 * eps(T) * norm(ref)
+        # threaded direct chains, which four-step routing bypasses at most of these sizes
+        FFTJ.factor_radices(n) !== nothing &&
+            @test FFTJ._plan(T, n, -1; nthreads=4)(x) == FFTJ._plan(T, n, -1; nthreads=1)(x)
 
         pt_inv = plan_ifft(T, n)
         @test pt_inv(yt) == serial_like(pt_inv)(yt)

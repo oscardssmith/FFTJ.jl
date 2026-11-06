@@ -50,24 +50,31 @@ Pipeline for a 1-D transform of length n:
   fixed: `@inbounds` does not propagate into `ntuple` closures (bounds checks
   cost ~20% at radix 5), and tuple `map`/runtime-length `ntuple` allocate
   past inference limits.
-- **n with larger prime factors** (or wide-vector-Float32 small odd sizes,
-  see `_slow_smooth`): Bluestein's algorithm (bluestein.jl) over a padded
-  length from `nextsmooth` (small odd part × large power of two), reusing two
-  ordinary `FFTPlan`s.
+- **out-of-cache smooth n** (≥ `_FS_MIN_BYTES`, 7-smooth with a tiling
+  split): two-pass four-step `FourStepPlan` (fourstep.jl), each pass reading
+  and writing the data once, threaded across strips/groups with per-task
+  scratch.
+- **n with larger prime factors** (or small odd-heavy Float32 sizes, see
+  `_slow_smooth`): a large smooth factor × a non-smooth one runs as
+  `CompositePlan` (composite.jl); odd n ≥ ~1k (F64) / ~16k (F32) as
+  Harvey–van der Hoeven Gaussian resampling (`HvdhPlan`, hvdh.jl); the rest
+  as oversampled interpolation onto a smooth length (`ResamplePlan`,
+  resample.jl). These are serial for now (`plan_nt == 1`).
 - **real transforms** (real.jl): even n packs input as n/2 complex points via
   reinterpret (no copy) + O(n) even/odd split post-pass; odd n falls back to a
   full complex transform.
 - **N-d** (ndplan.jl): per-dimension batched-strided passes running the same
   stage kernels with effective stride s·Bi; dim-1 pencils that don't earn the
   fused-edge treatment run transposed with pencils as vector lanes. Non-smooth
-  dims gather pencils into buffers and run Bluestein per pencil. N-d plans
+  dims run a batched resampling pass (`RsPass`) with pencils as lanes. N-d plans
   transform all dims only (`region` must be `1:N`).
 
 File layout: `kernels.jl` (SIMD butterflies `bf2..bf8`, width selection,
 shuffles — generic over scalar and `SIMD.Vec`, so one kernel body serves both
 paths) → `stockham.jl` (stage loops: plain, small-stride, fused first/last,
 batched) → `plan.jl` (1-D planning, stage chains, `FFTPlan` execution) →
-`bluestein.jl` → `real.jl` → `ndplan.jl` → `api.jl` (FFTW-style user API:
+`resample.jl` → `real.jl` → `ndplan.jl` → `fourstep.jl` → `hvdh.jl` →
+`composite.jl` → `api.jl` (FFTW-style user API:
 array-based planning, `*`/`mul!`, `inv`, in-place `InplacePlan`, `Scaled`,
 one-shots, promoting fallbacks).
 
@@ -78,7 +85,7 @@ Key invariants and conventions:
   `_PLAN_CACHE_LOCK`; only per-plan scratch buffers are fresh. Repeated
   planning at one size must stay cheap — DSP-style code plans per call.
 - **Twiddle accuracy**: angles are computed in units of π (`sincospi`) with
-  exact integer reduction (e.g. `j² mod 2n` for the Bluestein chirp) — don't
+  exact integer reduction (e.g. `j·k mod 2n` for four-step twiddles) — don't
   replace with `exp(2πi...)` floating-point angle math.
 - **SIMD width** is picked at load time from host vector register bits
   (`VECTOR_BITS` / `pick_width` in kernels.jl); the "small-stride" twiddle
@@ -89,8 +96,6 @@ Key invariants and conventions:
 - `inv(p).p` must remain the unnormalized backward plan and `Scaled`/`.scale`
   public — DSP.jl unwraps them (`inv(plan_fft!(x)).p` idiom, tested in
   runtests.jl).
-- Sharing scratch (`bufs` kwarg of `_plan`) is only safe for plans that never
-  execute concurrently, e.g. Bluestein's sequential forward/inverse pair.
 
 Threading (threads.jl; design: docs/superpowers/specs/2026-08-30-fftj-threading-design.md):
 
@@ -111,18 +116,18 @@ Threading (threads.jl; design: docs/superpowers/specs/2026-08-30-fftj-threading-
   never reuse a captured local's name across branches.
 - Parallel split per stage: butterflies (`p`) when `m ≥ nt`, else stride
   lanes (`q`) in W-aligned chunks; N-d passes prefer whole independent blocks
-  (`Bo ≥ nt`). Bluestein/rfft pencil loops parallelize over per-task serial
-  plan clones stored in the plan (cheap: immutable parts are cached/shared).
+  (`Bo ≥ nt`). Four-step splits pass A's strips and pass B's groups across
+  tasks, each with its own scratch (`FsScratch`).
 - Threaded (default) plans may allocate O(nstages·nt) task objects per call —
   the zero-alloc guarantee applies to `nthreads=1` plans only. The N-d
   non-batched real path has a known pre-existing 32 B/pencil wrapper
   allocation independent of threading.
-- Scaling is bandwidth-bound: good while the working set is cache-resident
-  (~2–3× on 4 cores up to ~2^20). Above FOURSTEP_MIN (2^21), *threaded*
-  smooth plans route to the four-step/six-step `FourStepPlan` (fourstep.jl):
-  3 transposes + 2 cache-resident pencil-FFT phases with a fused twiddle,
-  measured 0.74–0.85× direct at 4t. Serial plans stay direct — one core
-  can't saturate DRAM, so four-step's extra sweeps lose serially (1.1–1.7×).
-  Routing therefore depends on the effective task count; the bitwise
-  threaded==serial tests compare against a same-algorithm serial plan
-  (`serial_like` in test/threading.jl), not `plan_*(...; nthreads=1)`.
+- Scaling is bandwidth-bound: direct chains scale ~2–3× on 4 cores while
+  cache-resident. Out-of-cache smooth sizes route to `FourStepPlan` whether
+  threaded or not (measured 4t: 0.5–0.85× threaded direct from 2^20; a
+  three-transpose six-step variant lost to it everywhere and was removed).
+  The bitwise threaded==serial tests compare against a same-algorithm serial
+  plan (`serial_like` in test/threading.jl).
+- Serial benchmarks of memory-bound sizes swing badly under background load
+  (same-process ratios moved 0.6→1.0 between runs at load ~3); measure
+  routing thresholds on a quiet machine.

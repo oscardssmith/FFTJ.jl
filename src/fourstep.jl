@@ -92,6 +92,21 @@ function _lanes_fft!(q::InnerFourStep{T}, stages, are, aim, bre, bim, N, L, d::V
     return isodd(length(q.stB)) ? (are, aim) : (bre, bim)
 end
 
+# one task's strip buffers, with its own copies of the nested scratch
+struct FsScratch{T}
+    are::Vector{T}
+    aim::Vector{T}
+    bre::Vector{T}
+    bim::Vector{T}
+    innerA::Union{Nothing,InnerFourStep{T}}
+    innerB::Union{Nothing,InnerFourStep{T}}
+end
+
+_inner_clone(::Nothing) = nothing
+_inner_clone(q::InnerFourStep{T}) where {T} =
+    InnerFourStep{T}(q.N, q.L, q.M1, q.M2, q.P1, q.stA, q.stB, q.twr, q.twi,
+                     similar(q.sre), similar(q.sim))
+
 struct FourStepPlan{T,D}
     n::Int
     N1::Int
@@ -115,12 +130,12 @@ struct FourStepPlan{T,D}
     loi::Vector{T}
     zre::Vector{T}          # n-element intermediate planes
     zim::Vector{T}
-    are::Vector{T}          # strip buffers
-    aim::Vector{T}
-    bre::Vector{T}
-    bim::Vector{T}
+    ws::Vector{FsScratch{T}}   # per-task strip buffers
+    nt::Int
     scale::T
 end
+
+plan_nt(p::FourStepPlan) = p.nt
 
 # (N1, N2) for a 7-smooth n, or nothing when the split doesn't tile into
 # width·W strips. With N2 = 0, a balanced power-of-two N2 (the odd part goes
@@ -151,7 +166,7 @@ _use_fourstep(::Type{T}, n::Int) where {T} =
 
 function _fourstep(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                    N2::Int=0, width::Int=1, zpad::Int=pick_width(T),
-                   ipad::Int=1) where {T<:AbstractFloat}
+                   ipad::Int=1, nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     W = pick_width(T)
     split = _fourstep_split(T, n, width, N2)
     split === nothing &&
@@ -191,36 +206,51 @@ function _fourstep(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
     innerA = _inner_fourstep(T, N2, S, D, ipad)
     innerB = _inner_fourstep(T, N1, G, D, ipad)
     nb = max(S * _lanes_rows(innerA, N2), G * _lanes_rows(innerB, N1))
+    nt = min(plan_tasks(n, nthreads), N1 ÷ S, N2 ÷ G)
+    ws = [FsScratch{T}(Vector{T}(undef, nb), Vector{T}(undef, nb),
+                       Vector{T}(undef, nb), Vector{T}(undef, nb),
+                       i == 1 ? innerA : _inner_clone(innerA),
+                       i == 1 ? innerB : _inner_clone(innerB)) for i in 1:nt]
     return FourStepPlan{T,D}(n, N1, N2, S, G, Z1, stA, stB, innerA, innerB,
                              R, b1r, b1i, b2r, b2i, K, hir, hii, lor, loi,
                              Vector{T}(undef, Z1 * N2), Vector{T}(undef, Z1 * N2),
-                             Vector{T}(undef, nb), Vector{T}(undef, nb),
-                             Vector{T}(undef, nb), Vector{T}(undef, nb), scale)
+                             ws, nt, scale)
 end
 
 function (p::FourStepPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
     n = p.n
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
+    na, nb = p.N1 ÷ p.S, p.N2 ÷ p.G
     GC.@preserve x y begin
-        _fourstep_a!(p, _rawptr(x))
-        _fourstep_b!(p, _rawptr(y))
+        px, py = _rawptr(x), _rawptr(y)
+        if p.nt > 1
+            # strips (pass A) and groups (pass B) are independent; the
+            # barrier between the passes orders z's writes before its reads
+            tforeach_chunks((ci, lo, hi) -> _fourstep_a!(p, p.ws[ci], px, lo, hi), na, p.nt)
+            tforeach_chunks((ci, lo, hi) -> _fourstep_b!(p, p.ws[ci], py, lo, hi), nb, p.nt)
+        else
+            _fourstep_a!(p, p.ws[1], px, 1, na)
+            _fourstep_b!(p, p.ws[1], py, 1, nb)
+        end
     end
     return y
 end
 
 (p::FourStepPlan{T})(x::Vector{Complex{T}}) where {T} = p(similar(x), x)
 
-# pass A: per strip of S columns j1 = c..c+S-1, gather rows j2, transform
-# over j2, twiddle by ω^{j1·k2} = ω^{c·k2}·ω^{l·k2} and store into z
-function _fourstep_a!(p::FourStepPlan{T,D}, px::Ptr{T}) where {T,D}
+# pass A, strips slo..shi: per strip of S columns j1 = c..c+S-1, gather rows
+# j2, transform over j2, twiddle by ω^{j1·k2} = ω^{c·k2}·ω^{l·k2} and store
+# into z
+function _fourstep_a!(p::FourStepPlan{T,D}, buf::FsScratch{T}, px::Ptr{T},
+                      slo::Int, shi::Int) where {T,D}
     W = pick_width(T)
     sz = sizeof(T)
     N1, N2, S, K = p.N1, p.N2, p.S, p.K
-    are, aim, zre, zim = p.are, p.aim, p.zre, p.zim
+    are, aim, zre, zim = buf.are, buf.aim, p.zre, p.zim
     M1, M2, P1 = _lanes_geom(p.innerA, N2)
     Z1 = p.Z1
-    @inbounds for c in 0:S:N1-1
+    @inbounds for c in S*(slo-1):S:S*shi-1
         # row j2 = a + M1·b goes to slot b + M2·a
         for a in 0:M1-1, b in 0:M2-1, v in 0:W:S-1
             e = c + N1 * (a + M1 * b) + v
@@ -230,7 +260,7 @@ function _fourstep_a!(p::FourStepPlan{T,D}, px::Ptr{T}) where {T,D}
             vstore(r, are, S * (b + M2 * a) + v + 1)
             vstore(i, aim, S * (b + M2 * a) + v + 1)
         end
-        cre, cim = _lanes_fft!(p.innerA, p.stA, are, aim, p.bre, p.bim, N2, S, Val(D))
+        cre, cim = _lanes_fft!(buf.innerA, p.stA, are, aim, buf.bre, buf.bim, N2, S, Val(D))
         # output row k2 = b + M2·a sits at slot a + P1·b
         for b in 0:M2-1, a in 0:M1-1
             k2 = b + M2 * a
@@ -258,17 +288,19 @@ function _fourstep_a!(p::FourStepPlan{T,D}, px::Ptr{T}) where {T,D}
     return nothing
 end
 
-# pass B: per group of G columns k2 = c2..c2+G-1 (one contiguous block of z),
-# transpose into lanes, transform over j1, write rows k1 of y in natural order
-function _fourstep_b!(p::FourStepPlan{T,D}, py::Ptr{T}) where {T,D}
+# pass B, groups glo..ghi: per group of G columns k2 = c2..c2+G-1 (one
+# contiguous block of z), transpose into lanes, transform over j1, write rows
+# k1 of y in natural order
+function _fourstep_b!(p::FourStepPlan{T,D}, buf::FsScratch{T}, py::Ptr{T},
+                      glo::Int, ghi::Int) where {T,D}
     W = pick_width(T)
     sz = sizeof(T)
     N1, N2, G = p.N1, p.N2, p.G
-    are, aim, zre, zim = p.are, p.aim, p.zre, p.zim
+    are, aim, zre, zim = buf.are, buf.aim, p.zre, p.zim
     sc = Vec{W,T}(p.scale)
     M1, M2, P1 = _lanes_geom(p.innerB, N1)
     Z1 = p.Z1
-    @inbounds for c2 in 0:G:N2-1
+    @inbounds for c2 in G*(glo-1):G:G*ghi-1
         for g0 in 0:W:G-1
             off = Z1 * (c2 + g0)
             for j1 in 0:W:N1-1
@@ -285,7 +317,7 @@ function _fourstep_b!(p::FourStepPlan{T,D}, py::Ptr{T}) where {T,D}
                 end
             end
         end
-        cre, cim = _lanes_fft!(p.innerB, p.stB, are, aim, p.bre, p.bim, N1, G, Val(D))
+        cre, cim = _lanes_fft!(buf.innerB, p.stB, are, aim, buf.bre, buf.bim, N1, G, Val(D))
         # output row k1 = b + M2·a sits at slot a + P1·b
         for b in 0:M2-1, a in 0:M1-1, v in 0:W:G-1
             k1 = b + M2 * a
