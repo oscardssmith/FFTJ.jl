@@ -106,6 +106,8 @@ struct SplitPlan{T,D,H}
     p::Int
     s::Int
     hv::H                      # length-p HvdH, unnormalized
+    hvs::Vector{H}             # per-task serial copies (sharing hv's tables)
+                               # when sub-transforms split across tasks, else [hv]
     stages::Vector{Stage{T}}   # length-s chain, inner batch p
     K::Int                     # two-level twiddles: ω^e = hi[e ÷ K]·lo[e % K]
     hir::Vector{T}
@@ -115,11 +117,12 @@ struct SplitPlan{T,D,H}
     lvr::Vector{T}             # lane twiddles lv[W·r + l + 1] = ω^{r·l}
     lvi::Vector{T}
     xs::Vector{Complex{T}}     # the s decimated inputs, contiguous
-    ys::Vector{Complex{T}}     # its transform
+    yss::Vector{Vector{Complex{T}}}   # per-task sub-transform output
     are::Vector{T}
     aim::Vector{T}
     bre::Vector{T}
     bim::Vector{T}
+    nt::Int
     scale::T
 end
 
@@ -155,37 +158,64 @@ function _split(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
         si, co = sincospi(Tw(2 * D * (r * l)) / n)
         lvr[W*r+l+1] = T(co); lvi[W*r+l+1] = T(si)
     end
-    # threads inside each sub-transform; the decimate/twiddle/combine passes
-    # are O(n) and stay serial
-    hv = _hvdh(T, p, D, one(T); nthreads)
+    # with at least as many sub-transforms as tasks, tasks take whole serial
+    # sub-transforms; with fewer, each sub-transform threads internally
+    nt = plan_tasks(n, nthreads)
+    across = nt > 1 && s ≥ nt
+    hv = _hvdh(T, p, D, one(T); nthreads=across ? 1 : nthreads)
+    hvs = across ? [hv; [_hvdh_serial_clone(hv) for _ in 2:nt]] : [hv]
     stages, _ = build_stages_cached(T, s, D; allow_small=false)
-    return SplitPlan{T,D,typeof(hv)}(n, p, s, hv, stages, K, hir, hii, lor, loi, lvr, lvi,
-                                     Vector{Complex{T}}(undef, n), Vector{Complex{T}}(undef, p),
+    return SplitPlan{T,D,typeof(hv)}(n, p, s, hv, hvs, stages, K, hir, hii, lor, loi, lvr, lvi,
+                                     Vector{Complex{T}}(undef, n),
+                                     [Vector{Complex{T}}(undef, p) for _ in hvs],
                                      Vector{T}(undef, n), Vector{T}(undef, n),
-                                     Vector{T}(undef, n), Vector{T}(undef, n), scale)
+                                     Vector{T}(undef, n), Vector{T}(undef, n), nt, scale)
 end
 
 function (q::SplitPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
     n, p, s = q.n, q.p, q.s
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
-    xs, ys, are, aim = q.xs, q.ys, q.are, q.aim
+    nt = q.nt
     # one sequential pass over x into the s decimated sequences
-    @inbounds for j in 0:p-1, r in 0:s-1
-        xs[r*p+j+1] = x[s*j+r+1]
+    if nt > 1
+        tforeach((lo, hi) -> _split_gather!(q, x, lo - 1, hi - 1), p, nt)
+    else
+        _split_gather!(q, x, 0, p - 1)
     end
-    @inbounds for r in 0:s-1
-        q.hv(ys, view(xs, r*p+1:(r+1)*p))
-        _split_twiddle!(are, aim, p * r, ys, q, r)
+    # sub-transform r writes only planes p·r .. p·r + p - 1
+    if length(q.hvs) > 1
+        tforeach_chunks((ci, lo, hi) -> _split_subs!(q, ci, lo - 1, hi - 1), s, nt)
+    else
+        _split_subs!(q, 1, 0, s - 1)
     end
-    cre, cim, _, _ = run_chain!(are, aim, q.bre, q.bim, q.stages, s, 1, p, Val(D))
-    interleave_all!(y, cre, cim, q.scale)
+    cre, cim, _, _ = run_chain!(q.are, q.aim, q.bre, q.bim, q.stages, s, 1, p, Val(D), nt)
+    interleave_all!(y, cre, cim, q.scale, nt)
     return y
 end
 
 (q::SplitPlan{T})(x::Vector{Complex{T}}) where {T} = q(similar(x), x)
 
-plan_nt(q::SplitPlan) = plan_nt(q.hv)
+plan_nt(q::SplitPlan) = q.nt
+
+function _split_gather!(q::SplitPlan, x, jlo::Int, jhi::Int)
+    p, s, xs = q.p, q.s, q.xs
+    @inbounds for j in jlo:jhi, r in 0:s-1
+        xs[r*p+j+1] = x[s*j+r+1]
+    end
+    return nothing
+end
+
+# sub-transforms rlo..rhi on task ci's plan and output buffer, twiddled into
+# their plane rows
+function _split_subs!(q::SplitPlan, ci::Int, rlo::Int, rhi::Int)
+    p, hv, ys = q.p, q.hvs[ci], q.yss[ci]
+    @inbounds for r in rlo:rhi
+        hv(ys, view(q.xs, r*p+1:(r+1)*p))
+        _split_twiddle!(q.are, q.aim, p * r, ys, q, r)
+    end
+    return nothing
+end
 
 # planes at o + k1 ← ω^{r·k1}·ys[k1], per W-lane window as
 # ω^{r·k1₀}·ω^{r·l}; windows may overlap (out of place)
