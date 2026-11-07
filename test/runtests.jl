@@ -148,10 +148,12 @@ end
     @testset "n = $n" for n in ns
         x = randn(rng, Complex{T}, n)
         ref = FFTW.fft(ComplexF64.(x))
-        p = plan_fft(T, n)
+        p = plan_fft(T, n; nthreads=1)
         @test p isa FFTJ.CompositePlan
         y = p(x)
         @test norm(y .- ref) ≤ 100 * eps(T) * norm(ref)
+        # threaded (lane chunks over tasks from 2^16 elements) is bitwise serial
+        @test plan_fft(T, n; nthreads=4)(x) == y
         pinv = plan_ifft(T, n)
         @test norm(pinv(y) .- x) ≤ 100 * eps(T) * norm(x)
         pb = plan_bfft(T, n)

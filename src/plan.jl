@@ -174,7 +174,7 @@ function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                   nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     n ≥ 1 || throw(ArgumentError("transform length must be positive (got $n)"))
     if factor_radices(n) === nothing
-        _use_composite(T, n) && return _composite(T, n, D, scale)
+        _use_composite(T, n) && return _composite(T, n, D, scale; nthreads)
         _use_hvdh(T, n) && return _hvdh(T, n, D, scale; nthreads)
         _use_split(T, n) && return _split(T, n, D, scale; nthreads)
         return _resample(T, n, D, scale)

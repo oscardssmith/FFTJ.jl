@@ -60,8 +60,8 @@ Base.size(p::IrfftPlan) = (p.n ÷ 2 + 1,)
 Base.size(ip::InplacePlan) = size(ip.p)
 
 _dir(::FFTPlan{T,D}) where {T,D} = D
-# serial-only plan types
-plan_nt(::Union{ResamplePlan,CompositePlan}) = 1
+# serial-only plan type
+plan_nt(::ResamplePlan) = 1
 
 _dir(::FourStepPlan{T,D}) where {T,D} = D
 _dir(::ResamplePlan{T,D}) where {T,D} = D

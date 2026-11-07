@@ -767,14 +767,25 @@ end
 
 function _rs_block!(q::HvPass{T}, xre::Vector{T}, xim::Vector{T}, off::Int,
                     d::Val, tw=nothing) where {T}
+    _rs_chunks!(q, xre, xim, off, d, tw, 0, max(1, q.B ÷ q.C) - 1)
+    return nothing
+end
+
+function _rs_chunks!(q::HvPass{T}, xre::Vector{T}, xim::Vector{T}, off::Int,
+                     d::Val, tw, clo::Int, chi::Int) where {T}
     B, C = q.B, q.C
     nc = max(1, B ÷ C)
-    for c in 0:nc-1
+    for c in clo:chi
         i0 = c * C
         _hv_chunk!(q, xre, xim, off, i0, c == nc - 1 ? B - i0 : C, d, tw)
     end
     return nothing
 end
+
+_rs_clone(q::HvPass{T}) where {T} =
+    HvPass{T}(q.n, q.t, q.w, q.nb, q.H, q.R, q.B, q.C, q.wt, q.l0, q.cf, q.oi, q.q0, q.sc,
+              q.stages, similar(q.ro), similar(q.are), similar(q.aim), similar(q.pre),
+              similar(q.pim), similar(q.qre), similar(q.qim), zero(q.zr), zero(q.zi))
 
 function _hv_chunk!(q::HvPass{T}, xre::Vector{T}, xim::Vector{T}, off0::Int, i0::Int,
                     L::Int, d::Val, tw) where {T}

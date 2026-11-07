@@ -11,6 +11,7 @@ struct DimPass{T}
     stages::Vector{Stage{T}}   # empty when fallback is used
     bstages::Vector{Stage{T}}  # batched-transposed chain (dim 1 only; may be empty)
     fallback::Union{Nothing,RsPass{T}}   # non-smooth dims: batched resampling
+    fallbacks::Vector{RsPass{T}}         # per-task copies of fallback ([fallback] serial)
 end
 
 struct NdPlan{T,D,N}
@@ -64,11 +65,12 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
             else
                 Stage{T}[]
             end
-            push!(passes, DimPass{T}(nd, Bi, Bo, stages, bstages, nothing))
+            push!(passes, DimPass{T}(nd, Bi, Bo, stages, bstages, nothing, RsPass{T}[]))
         else
             # dim 1 runs transposed so the pencils become the lanes
-            push!(passes, DimPass{T}(nd, Bi, Bo, Stage{T}[], Stage{T}[],
-                                     _rs_pass(T, nd, D, Bi == 1 ? Bo : Bi)))
+            fb = _rs_pass(T, nd, D, Bi == 1 ? Bo : Bi)
+            push!(passes, DimPass{T}(nd, Bi, Bo, Stage{T}[], Stage{T}[], fb,
+                                     _rs_copies(fb, nt)))
         end
     end
     fuse_in = false
@@ -120,15 +122,16 @@ end
 # non-smooth dim: batched resampling in place on the current planes; dim 1
 # transposes through the other planes so its pencils become the lanes
 function _rs_pass!(cre::Vector{T}, cim::Vector{T}, ore::Vector{T}, oim::Vector{T},
-                   pass::DimPass{T}, q::RsPass{T}, d::Val) where {T}
+                   pass::DimPass{T}, d::Val, nt::Int) where {T}
     nd, Bi, Bo = pass.nd, pass.Bi, pass.Bo
+    qs = pass.fallbacks
     if Bi == 1 && Bo > 1
-        transpose_planes!(ore, oim, cre, cim, nd, Bo)
-        _rs_block!(q, ore, oim, 0, d)
-        transpose_planes!(cre, cim, ore, oim, Bo, nd)
+        transpose_planes!(ore, oim, cre, cim, nd, Bo, nt)
+        _rs_block_par!(qs, ore, oim, 0, d, nothing, nt)
+        transpose_planes!(cre, cim, ore, oim, Bo, nd, nt)
     else
         for o in 0:Bo-1
-            _rs_block!(q, cre, cim, o * Bi * nd, d)
+            _rs_block_par!(qs, cre, cim, o * Bi * nd, d, nothing, nt)
         end
     end
     return nothing
@@ -256,9 +259,8 @@ function _nd_core!(p::NdPlan{T,D,N}, y, py::Ptr{T}, cre, cim, ore, oim,
     @inbounds begin
         for (pi, pass) in enumerate(p.passes)
             pi == 1 && skip1 && continue
-            fb = pass.fallback
-            if fb !== nothing
-                _rs_pass!(cre, cim, ore, oim, pass, fb, Val(D))
+            if pass.fallback !== nothing
+                _rs_pass!(cre, cim, ore, oim, pass, Val(D), nt)
                 continue
             end
             from = pi == 1 ? stagestart : 1

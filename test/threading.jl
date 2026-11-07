@@ -21,10 +21,12 @@ serial_like(p::FFTJ.HvdhPlan{T,D}) where {T,D} =
     FFTJ._hvdh(T, p.n, D, p.scale; nthreads=1)
 serial_like(p::FFTJ.SplitPlan{T,D}) where {T,D} =
     FFTJ._split(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::Union{FFTJ.ResamplePlan,FFTJ.CompositePlan}) = p
+serial_like(p::FFTJ.CompositePlan{T,D}) where {T,D} =
+    FFTJ._composite(T, p.n, D, p.scale; nthreads=1)
+serial_like(p::FFTJ.ResamplePlan) = p
 
-# plan types with no threaded execution yet
-serial_only(p) = p isa Union{FFTJ.ResamplePlan,FFTJ.CompositePlan} ||
+# plan types with no threaded execution (resampling gets small sizes only)
+serial_only(p) = p isa FFTJ.ResamplePlan ||
                  (p isa Union{FFTJ.RfftPlan,FFTJ.IrfftPlan} && serial_only(p.inner))
 function serial_like(p::FFTJ.RfftPlan{T}) where {T}
     inner = serial_like(p.inner)

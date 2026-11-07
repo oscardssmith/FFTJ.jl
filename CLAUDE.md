@@ -63,8 +63,12 @@ Pipeline for a 1-D transform of length n:
   as oversampled interpolation onto a smooth length (`ResamplePlan`,
   resample.jl). HvdH threads its permute, spread (in units aligned to its
   recurrence re-seeds), inner transform and group solves (per-task
-  `HvdhScratch`); `SplitPlan` threads inside its sub-transforms. Composite
-  and resample plans are serial (`plan_nt == 1`).
+  `HvdhScratch`); `SplitPlan` gives tasks whole sub-transforms when s ≥ nt,
+  else threads inside them. The batched `RsPass`/`HvPass` (N-d non-smooth
+  dims, composite) spread their lane chunks over per-task copies
+  (`_rs_copies`: shared tables, own scratch); chunking never depends on nt.
+  Only `ResamplePlan` is serial; it gets small sizes only (F64 below ~16k,
+  F32 below ~250k, where split's p < 16384 cutoff leaves even n).
 - **real transforms** (real.jl): even n packs input as n/2 complex points via
   reinterpret (no copy) + O(n) even/odd split post-pass; odd n falls back to a
   full complex transform.

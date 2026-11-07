@@ -13,6 +13,7 @@ struct CompositePlan{T,D}
     s::Int
     stages::Vector{Stage{T}}   # length-s chain, inner batch p
     rs::Union{RsPass{T},HvPass{T}}   # length-p resampling, s lanes
+    rss::Union{Vector{RsPass{T}},Vector{HvPass{T}}}   # per-task copies of rs
     K::Int                     # two-level twiddles: ω^e = hi[e ÷ K]·lo[e % K]
     hir::Vector{T}
     hii::Vector{T}
@@ -24,8 +25,11 @@ struct CompositePlan{T,D}
     aim::Vector{T}
     bre::Vector{T}
     bim::Vector{T}
+    nt::Int
     scale::T
 end
+
+plan_nt(q::CompositePlan) = q.nt
 
 # smallest smooth factor, and smallest n per precision, routed here rather
 # than to full-length resampling: measured crossovers (F64 loses at 3.2k
@@ -51,8 +55,8 @@ end
 _use_composite(::Type{T}, n::Int) where {T} =
     n ≥ _composite_min_n(T) && _smooth_part(n) ≥ _COMPOSITE_MIN_S
 
-function _composite(::Type{T}, n::Int, D::Int,
-                    scale::T=default_scale(T, n, D)) where {T<:AbstractFloat}
+function _composite(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
+                    nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     s = _smooth_part(n)
     p = n ÷ s
     Tw = promote_type(T, Float64)
@@ -76,21 +80,23 @@ function _composite(::Type{T}, n::Int, D::Int,
     end
     stages, _ = build_stages_cached(T, s, D; allow_small=false)
     rs = p ≥ _COMPOSITE_HV_MINP ? _hv_pass(T, p, D, s) : _rs_pass(T, p, D, s)
-    return CompositePlan{T,D}(n, p, s, stages, rs, K,
+    nt = plan_tasks(n, nthreads)
+    return CompositePlan{T,D}(n, p, s, stages, rs, _rs_copies(rs, nt), K,
                               hir, hii, lor, loi, lvr, lvi,
                               Vector{T}(undef, n), Vector{T}(undef, n),
-                              Vector{T}(undef, n), Vector{T}(undef, n), scale)
+                              Vector{T}(undef, n), Vector{T}(undef, n), nt, scale)
 end
 
 function (q::CompositePlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
-    n, p, s = q.n, q.p, q.s
+    n, p, s, nt = q.n, q.p, q.s, q.nt
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
-    deinterleave_all!(q.are, q.aim, x)
-    cre, cim, ore, oim = run_chain!(q.are, q.aim, q.bre, q.bim, q.stages, s, 1, p, Val(D))
-    transpose_planes!(ore, oim, cre, cim, p, s)
-    _rs_block!(q.rs, ore, oim, 0, Val(D), q)   # twiddles fused into its deconvolution
-    interleave_all!(y, ore, oim, q.scale)
+    deinterleave_all!(q.are, q.aim, x, nt)
+    cre, cim, ore, oim = run_chain!(q.are, q.aim, q.bre, q.bim, q.stages, s, 1, p, Val(D), nt)
+    transpose_planes!(ore, oim, cre, cim, p, s, nt)
+    # twiddles fused into its deconvolution; lane chunks spread over tasks
+    _rs_block_par!(q.rss, ore, oim, 0, Val(D), q, nt)
+    interleave_all!(y, ore, oim, q.scale, nt)
     return y
 end
 

@@ -466,14 +466,43 @@ end
 # factors (row j, lane i) folded into the deconvolution (_rows_scale_tw!).
 function _rs_block!(q::RsPass{T}, xre::Vector{T}, xim::Vector{T}, off::Int,
                     d::Val, tw=nothing) where {T}
+    _rs_chunks!(q, xre, xim, off, d, tw, 0, max(1, q.B ÷ q.C) - 1)
+    return nothing
+end
+
+# chunks clo..chi of a block (the last chunk absorbs the remainder lanes)
+function _rs_chunks!(q::RsPass{T}, xre::Vector{T}, xim::Vector{T}, off::Int,
+                     d::Val, tw, clo::Int, chi::Int) where {T}
     B, C = q.B, q.C
     nc = max(1, B ÷ C)
-    for c in 0:nc-1
+    for c in clo:chi
         i0 = c * C
         _rs_chunk!(q, xre, xim, off, i0, c == nc - 1 ? B - i0 : C, d, tw)
     end
     return nothing
 end
+
+# _rs_block! with the chunks spread over tasks, task ci on qs[ci] (copies
+# sharing qs[1]'s tables); chunking doesn't depend on the task count, so
+# results are bitwise serial
+function _rs_block_par!(qs::Vector{Q}, xre::Vector{T}, xim::Vector{T}, off::Int,
+                        d::Val, tw, nt::Int) where {Q,T}
+    nc = max(1, qs[1].B ÷ qs[1].C)
+    if nt > 1 && length(qs) > 1 && nc > 1
+        tforeach_chunks((ci, lo, hi) -> _rs_chunks!(qs[ci], xre, xim, off, d, tw, lo - 1, hi - 1),
+                        nc, min(nt, length(qs)))
+    else
+        _rs_chunks!(qs[1], xre, xim, off, d, tw, 0, nc - 1)
+    end
+    return nothing
+end
+
+# per-task copies of a batched pass: shared tables, fresh chunk scratch
+_rs_copies(q, nt::Int) = nt > 1 ? [q; [_rs_clone(q) for _ in 2:min(nt, max(1, q.B ÷ q.C))]] : [q]
+
+_rs_clone(q::RsPass{T}) where {T} =
+    RsPass{T}(q.n, q.m, q.w, q.B, q.C, q.corr, q.wt, q.l0, q.stages,
+              similar(q.pre), similar(q.pim), similar(q.qre), similar(q.qim))
 
 function _rs_chunk!(q::RsPass{T}, xre::Vector{T}, xim::Vector{T}, off0::Int, i0::Int,
                     L::Int, d::Val, tw) where {T}
