@@ -100,46 +100,34 @@ default_scale(::Type{T}, n, D) where {T} = D == -1 ? one(T) : one(T) / n
 # redefine it and rebuild)
 const _RADIX8_TOWER = true
 
-# (final radix f, tower radices) for a power-of-two part 2^a. The tower opens
-# with radix 4 (fused-input and small-stride layouts are radix-4 only) and
-# stays radix 4 while a 1-D stride is below W; the rest takes radix 8 where it
-# can, with f chosen jointly so the chain is shortest: fewer stages, fewer
-# sweeps over the data. Without radix-8 towers: all radix 4, f = 2/4/8.
+# (final radix f, tower radices) for a power-of-two part 2^a, the final stage
+# being the last radix of the chain. Sizes first: a 1-D chain reserves k
+# leading radix-4 stages until its stride reaches W (small-stride and
+# fused-input layouts are radix-4 only); the other b bits take as many radix
+# 8s as possible (b mod 3 = 2: one radix 4, = 1: two). Then the order: radix
+# 4s first, radix 8s last, so a radix 8 lands on the twiddle-free final stage.
+# Without radix-8 towers: all radix 4 with a final 2/4/8.
 function _tower(::Type{T}, a::Int, allow_small::Bool) where {T}
     a == 0 && return 1, Int[]
-    f0 = isodd(a) ? (a ≥ 3 ? 8 : 2) : 4
-    best = (f0, fill(4, (a - trailing_zeros(f0)) ÷ 2))
-    _RADIX8_TOWER || return best
-    W = pick_width(T)
-    # radix 8 only when it saves a stage: at equal length the radix-4 tower
-    # with its twiddle-free final stage measured faster (512²: 1.06-1.17×)
-    for f in (8, 4, 2)
-        r = a - trailing_zeros(f)
-        r < 0 && continue
-        if r == 0
-            tower = Int[]
-        else
-            k = 1   # radix-4 prefix
-            while allow_small && 4^k < W && 2(k + 1) ≤ r
-                k += 1
-            end
-            rr = r - 2k
-            rr < 0 && continue
-            n8 = rr ÷ 3
-            while n8 ≥ 0 && isodd(rr - 3n8)
-                n8 -= 1
-            end
-            n8 < 0 && continue
-            tower = [fill(4, k); fill(8, n8); fill(4, (rr - 3n8) ÷ 2)]
-        end
-        length(tower) < length(best[2]) && (best = (f, tower))
+    a ≤ 3 && return 1 << a, Int[]
+    if !_RADIX8_TOWER
+        f = isodd(a) ? 8 : 4
+        return f, fill(4, (a - trailing_zeros(f)) ÷ 2)
     end
-    return best
+    W = pick_width(T)
+    k = 0
+    while allow_small && 4^k < W && 2(k + 1) ≤ a - 2   # leave ≥ 2 bits after
+        k += 1
+    end
+    b = a - 2k
+    n4 = (0, 2, 1)[b % 3 + 1]
+    rad = [fill(4, k + n4); fill(8, (b - 2n4) ÷ 3)]
+    return rad[end], rad[1:end-1]
 end
 
 # The 1-D stage chain for an n factoring over ODD_RADICES: final power-of-two
 # stage f (m == 1, twiddle-free, fusable); the rest of the 2-part runs as a
-# radix-4 tower first, so the odd-radix stages in between see large
+# tower first (_tower), so the odd-radix stages in between see large
 # W-divisible strides. allow_small=false suppresses the small-stride twiddle
 # layout (batched N-d passes run every stage at effective stride s·Bi ≥ W,
 # never the small path).
