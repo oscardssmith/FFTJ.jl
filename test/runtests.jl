@@ -398,6 +398,11 @@ end
     for n in (2835, 3^8, 3^12, 2 * 3^6 * 5^2 * 7^2, 13^3)
         @test plan_fft(Float64, n; nthreads=1) isa FFTJ.FourStepPlan
     end
+    # F64 with a 2-part of exactly 4W from 16k; threaded, any 2-part from 2^15
+    @test plan_fft(Float64, 1441440; nthreads=1) isa FFTJ.FourStepPlan
+    @test plan_fft(Float64, 12000; nthreads=1) isa FFTJ.FFTPlan
+    @test plan_fft(Float32, 40000; nthreads=1) isa FFTJ.FFTPlan
+    @test plan_fft(Float32, 40000; nthreads=4) isa FFTJ.FourStepPlan
     # tiled four-step from 1 MB threaded, 8 MB serial
     @test plan_fft(Float64, 2^18; nthreads=1) isa FFTJ.FFTPlan
     @test plan_fft(Float64, 2^19; nthreads=1) isa FFTJ.FourStepPlan

@@ -53,8 +53,9 @@ Pipeline for a 1-D transform of length n:
 - **four-step** `FourStepPlan` (fourstep.jl): two passes, each reading and
   writing the data once, threaded across strips/groups with per-task scratch
   (two fork-joins per call, so its own task count `_FS_TASK_MIN`). Taken by
-  odd-heavy smooth n (2-part < 4W, from ~2k F64 / ~1k F32 elements, serial or
-  threaded: `_use_ragged`) on a balanced split whose last strip/group may be
+  odd-heavy smooth n (2-part < 4W, from ~2k F64 / ~1k F32 elements; F64 with
+  a 2-part of 4W from 16k; any non-tiled n from 2^15 when threaded:
+  `_use_ragged`) on a balanced split whose last strip/group may be
   ragged (masked loads/stores, z padding), and by power-of-two-tiled splits
   from `_fs_min_bytes` (1 MB threaded, 8 MB serial).
 - **n with larger prime factors** (or small odd-heavy Float32 sizes, see

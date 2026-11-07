@@ -195,14 +195,23 @@ function _use_fourstep(::Type{T}, n::Int, threaded::Bool) where {T}
     return sp !== nothing && _fs_tiled(T, n, sp)
 end
 
-# Odd-heavy smooth n (2-part < 4W, so a direct chain's odd stages run at
-# scalar strides) run a balanced ragged four-step from small sizes, serial
-# or threaded: measured 0.31-0.73× the direct chain from ~2k (F64) / ~1k
-# (F32) elements, also below resampling. With a larger 2-part the direct
-# chain's radix-4 tower vectorizes and wins (F32 8000: four-step 2.7×).
-function _use_ragged(::Type{T}, n::Int) where {T}
-    (1 << trailing_zeros(n)) < 4 * pick_width(T) || return false
-    n ≥ (sizeof(T) ≥ 8 ? 2048 : 1024) || return false
+# Smooth n without a tiled split that run a balanced ragged four-step:
+# - odd-heavy (2-part < 4W, so a direct chain's odd stages run at scalar
+#   strides), serial or threaded: 0.31-0.73× the direct chain from ~2k
+#   (F64) / ~1k (F32) elements, also below resampling;
+# - F64 with a 2-part of exactly 4W, from 16k: 0.96 at 20k, 0.63-0.65
+#   from 300k (F32's 4W = 64 still loses serially, 1.3-2.7×);
+# - threaded, any 2-part, from 2^15: two fork-joins beat a direct chain's
+#   per-stage ones (0.40-0.93 from 20k F64 / 40k F32).
+# With a larger 2-part the serial direct chain's radix-4 tower vectorizes and
+# wins (F32 8000: four-step 2.7×).
+function _use_ragged(::Type{T}, n::Int, threaded::Bool=false) where {T}
+    a2 = 1 << trailing_zeros(n)
+    W4 = 4 * pick_width(T)
+    ok = (a2 < W4 && n ≥ (sizeof(T) ≥ 8 ? 2048 : 1024)) ||
+         (sizeof(T) ≥ 8 && a2 == W4 && n ≥ 1 << 14) ||
+         (threaded && n ≥ 1 << 15)
+    ok || return false
     sp = _fourstep_split(T, n, 1)
     return sp !== nothing && !_fs_tiled(T, n, sp)
 end

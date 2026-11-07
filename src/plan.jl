@@ -179,7 +179,7 @@ function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
         _use_split(T, n) && return _split(T, n, D, scale; nthreads)
         return _resample(T, n, D, scale)
     end
-    _use_ragged(T, n) && return _fourstep(T, n, D, scale; nthreads)
+    _use_ragged(T, n, nthreads > 1) && return _fourstep(T, n, D, scale; nthreads)
     _slow_smooth(T, n) && return _resample(T, n, D, scale)
     _use_fourstep(T, n, nthreads > 1 && n ≥ 2 * _FS_TASK_MIN) &&
         return _fourstep(T, n, D, scale; nthreads)
