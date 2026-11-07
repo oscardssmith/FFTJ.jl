@@ -245,11 +245,13 @@ end
 function _hvdh_serial_clone(p::HvdhPlan{T,D,w,K,B,P}) where {T,D,w,K,B,P}
     s0 = p.ws[1]
     sc = HvdhScratch{T}(zero(s0.yr), zero(s0.yi), copy(s0.uf), similar(s0.ob), zero(s0.ring))
-    pt = _anyplan(T, p.t, D, one(T); nthreads=1)::P
+    pt = _serial_copy(p.p)::P
     return HvdhPlan{T,D,w,K,B,P}(p.n, p.t, p.Δ, p.H, p.L, p.G, p.a, p.α, p.rc, p.rsm, p.srs,
                                  pt, p.ch, p.se, p.sx, p.so, similar(p.ure), similar(p.uim),
                                  similar(p.v), zero(p.Y), [sc], p.lt, p.ut, p.ot, 1, p.scale)
 end
+
+_serial_copy(p::HvdhPlan) = _hvdh_serial_clone(p)
 
 function _hvdh_groups!(p::HvdhPlan{T}, sc::HvdhScratch{T}, py::Ptr{T}, glo::Int, ghi::Int) where {T}
     tab = !isempty(p.lt)

@@ -42,6 +42,7 @@ const _FS_INNER_MAX = 1 << 19
 function _inner_fourstep(::Type{T}, N::Int, L::Int, D::Int, pad::Int) where {T}
     4 * L * N * sizeof(T) ≤ _FS_INNER_MAX && return nothing
     M2 = 1 << (trailing_zeros(N) ÷ 2)
+    M2 == 1 && return nothing   # no power-of-two part to nest on
     M1 = N ÷ M2
     Tw = promote_type(T, Float64)
     twr, twi = Vector{T}(undef, N), Vector{T}(undef, N)
@@ -137,33 +138,78 @@ end
 
 plan_nt(p::FourStepPlan) = p.nt
 
-# (N1, N2) for a 7-smooth n, or nothing when the split doesn't tile into
-# width·W strips. With N2 = 0, a balanced power-of-two N2 (the odd part goes
-# to N1), capped so pass A doesn't nest: one nested pass measured ~20%
-# faster than two. The cap stops at half balanced so pass B's buffers keep
-# growing as √n.
+# (N1, N2) with both factors chain-buildable and at least one strip wide, or
+# nothing. With N2 = 0: for a 7-smooth n whose split tiles into width·W
+# strips, a balanced power-of-two N2 (the odd part goes to N1), capped so
+# pass A doesn't nest: one nested pass measured ~20% faster than two; the cap
+# stops at half balanced so pass B's buffers keep growing as √n. Otherwise
+# the most balanced split (N2 ≤ √n); its last strip and group may be ragged.
 function _fourstep_split(::Type{T}, n::Int, width::Int, N2::Int=0) where {T}
     W = pick_width(T)
-    fac = factor_smooth(n)
-    (W > 1 && fac !== nothing) || return nothing
+    W > 1 || return nothing
+    S = width * W
     if N2 == 0
-        nflat = _FS_INNER_MAX ÷ (4 * width * W * sizeof(T))
-        Nb = 1 << (fac[1] ÷ 2)
-        N2 = max(min(Nb, prevpow(2, max(nflat, W))), Nb ÷ 2)
+        fac = factor_smooth(n)
+        if fac !== nothing
+            nflat = _FS_INNER_MAX ÷ (4 * width * W * sizeof(T))
+            Nb = 1 << (fac[1] ÷ 2)
+            P2 = max(min(Nb, prevpow(2, max(nflat, W))), Nb ÷ 2)
+            n % P2 == 0 && (n ÷ P2) % S == 0 && P2 % S == 0 && return (n ÷ P2, P2)
+        end
+        N2 = _fs_balanced(n, S)
+        N2 == 0 && return nothing
     end
     N1 = n ÷ N2
-    S = width * W
-    ok = N1 * N2 == n && N1 % S == 0 && N2 % S == 0
+    ok = N1 * N2 == n && N1 ≥ S && N2 ≥ S &&
+         factor_radices(N1) !== nothing && factor_radices(N2) !== nothing
     return ok ? (N1, N2) : nothing
 end
 
-# Smallest complex-data size routed to four-step. Threaded, parity with the
-# threaded direct chain near 1.5 MB. Serial, direct stays 10-20% ahead up
-# to 4 MB in both precisions (A/B vs main, every run agreeing) and ties at 8 MB.
-_fs_min_bytes(threaded::Bool) = threaded ? 3 << 19 : 8 << 20
+# largest divisor N2 ≤ √n with both factors chain-buildable and ≥ S, or 0
+function _fs_balanced(n::Int, S::Int)
+    for d in isqrt(n):-1:S
+        n % d == 0 || continue
+        factor_radices(d) !== nothing && factor_radices(n ÷ d) !== nothing && return d
+    end
+    return 0
+end
 
-_use_fourstep(::Type{T}, n::Int, threaded::Bool) where {T} =
-    2 * n * sizeof(T) ≥ _fs_min_bytes(threaded) && _fourstep_split(T, n, 1) !== nothing
+# the default split is the power-of-two one (both factors tile into strips)
+_fs_tiled(::Type{T}, n::Int, (N1, N2)) where {T} =
+    N1 % pick_width(T) == 0 && N2 % pick_width(T) == 0 && ispow2(N2)
+
+# Vec{W,Bool} for W floats of interleaved complex data: complex lanes
+# base .. base + W/2 - 1, valid below lim
+@inline _cmask(::Val{W}, base::Int, lim::Int) where {W} =
+    Vec{W,Int}(ntuple(f -> (f - 1) >> 1, Val(W))) + base < lim
+
+# Smallest complex-data size routed to a tiled (power-of-two) four-step.
+# Threaded (four-step's own task count), parity with the threaded direct
+# chain near 1 MB in both precisions. Serial, direct stays 10-20% ahead up
+# to 4 MB (A/B vs main, every run agreeing) and ties at 8 MB.
+_fs_min_bytes(threaded::Bool) = threaded ? 1 << 20 : 8 << 20
+
+function _use_fourstep(::Type{T}, n::Int, threaded::Bool) where {T}
+    2 * n * sizeof(T) ≥ _fs_min_bytes(threaded) || return false
+    sp = _fourstep_split(T, n, 1)
+    return sp !== nothing && _fs_tiled(T, n, sp)
+end
+
+# Odd-heavy smooth n (2-part < 4W, so a direct chain's odd stages run at
+# scalar strides) run a balanced ragged four-step from small sizes, serial
+# or threaded: measured 0.31-0.73× the direct chain from ~2k (F64) / ~1k
+# (F32) elements, also below resampling. With a larger 2-part the direct
+# chain's radix-4 tower vectorizes and wins (F32 8000: four-step 2.7×).
+function _use_ragged(::Type{T}, n::Int) where {T}
+    (1 << trailing_zeros(n)) < 4 * pick_width(T) || return false
+    n ≥ (sizeof(T) ≥ 8 ? 2048 : 1024) || return false
+    sp = _fourstep_split(T, n, 1)
+    return sp !== nothing && !_fs_tiled(T, n, sp)
+end
+
+# four-step synchronizes twice per call, not per stage, so it threads from
+# much smaller sizes than direct chains: one task per this many elements
+const _FS_TASK_MIN = 1 << 13
 
 function _fourstep(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                    N2::Int=0, width::Int=1, zpad::Int=pick_width(T),
@@ -203,26 +249,37 @@ function _fourstep(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
     stA, _ = build_stages_cached(T, N2, D; allow_small=false)
     stB, _ = build_stages_cached(T, N1, D; allow_small=false)
     zpad % W == 0 || throw(ArgumentError("zpad must be a multiple of $W (got $zpad)"))
+    # a ragged last strip writes its spare lanes into z's row padding
+    N1 % S == 0 || zpad ≥ S ||
+        throw(ArgumentError("zpad must cover a strip ($S) when N1 = $N1 is ragged"))
     Z1 = N1 + zpad
     innerA = _inner_fourstep(T, N2, S, D, ipad)
     innerB = _inner_fourstep(T, N1, G, D, ipad)
     nb = max(S * _lanes_rows(innerA, N2), G * _lanes_rows(innerB, N1))
-    nt = min(plan_tasks(n, nthreads), N1 ÷ S, N2 ÷ G)
+    na, ng = cld(N1, S), cld(N2, G)
+    nt = min(max(nthreads, 1), na, ng, max(1, n ÷ _FS_TASK_MIN))
     ws = [FsScratch{T}(Vector{T}(undef, nb), Vector{T}(undef, nb),
                        Vector{T}(undef, nb), Vector{T}(undef, nb),
                        i == 1 ? innerA : _inner_clone(innerA),
                        i == 1 ? innerB : _inner_clone(innerB)) for i in 1:nt]
+    # rows past N2 pad a ragged last group (read, never written; zero)
+    nz = Z1 * ng * G
     return FourStepPlan{T,D}(n, N1, N2, S, G, Z1, stA, stB, innerA, innerB,
                              R, b1r, b1i, b2r, b2i, K, hir, hii, lor, loi,
-                             Vector{T}(undef, Z1 * N2), Vector{T}(undef, Z1 * N2),
-                             ws, nt, scale)
+                             zeros(T, nz), zeros(T, nz), ws, nt, scale)
 end
+
+# the same algorithm as p on one task (routing can differ by task count, so
+# plan_*(...; nthreads=1) need not be)
+_serial_copy(p::FFTPlan{T,D}) where {T,D} = _plan(T, p.n, D, p.scale; nthreads=1)
+_serial_copy(p::FourStepPlan{T,D}) where {T,D} =
+    _fourstep(T, p.n, D, p.scale; N2=p.N2, nthreads=1)
 
 function (p::FourStepPlan{T,D})(y::CVec{T}, x::CVec{T}) where {T,D}
     n = p.n
     length(x) == n || throw(DimensionMismatch("plan length $n, input length $(length(x))"))
     length(y) == n || throw(DimensionMismatch("plan length $n, output length $(length(y))"))
-    na, nb = p.N1 ÷ p.S, p.N2 ÷ p.G
+    na, nb = cld(p.N1, p.S), cld(p.N2, p.G)
     GC.@preserve x y begin
         px, py = _rawptr(x), _rawptr(y)
         if p.nt > 1
@@ -252,11 +309,19 @@ function _fourstep_a!(p::FourStepPlan{T,D}, buf::FsScratch{T}, px::Ptr{T},
     M1, M2, P1 = _lanes_geom(p.innerA, N2)
     Z1 = p.Z1
     @inbounds for c in S*(slo-1):S:S*shi-1
+        # a ragged last strip (columns past N1) masks its loads, so it never
+        # reads past x; its spare lanes land in z's row padding
+        lim = N1 - c
         # row j2 = a + M1·b goes to slot b + M2·a
         for a in 0:M1-1, b in 0:M2-1, v in 0:W:S-1
             e = c + N1 * (a + M1 * b) + v
-            u = vload(Vec{W,T}, px + sz * 2e)
-            w = vload(Vec{W,T}, px + sz * (2e + W))
+            if lim ≥ S
+                u = vload(Vec{W,T}, px + sz * 2e)
+                w = vload(Vec{W,T}, px + sz * (2e + W))
+            else
+                u = vload(Vec{W,T}, px + sz * 2e, _cmask(Val(W), v, lim))
+                w = vload(Vec{W,T}, px + sz * (2e + W), _cmask(Val(W), v + W ÷ 2, lim))
+            end
             r, i = deinterleave2(u, w)
             vstore(r, are, S * (b + M2 * a) + v + 1)
             vstore(i, aim, S * (b + M2 * a) + v + 1)
@@ -302,9 +367,14 @@ function _fourstep_b!(p::FourStepPlan{T,D}, buf::FsScratch{T}, py::Ptr{T},
     M1, M2, P1 = _lanes_geom(p.innerB, N1)
     Z1 = p.Z1
     @inbounds for c2 in G*(glo-1):G:G*ghi-1
+        # a ragged last group reads z's zero rows past N2 and masks its stores
+        lim = N2 - c2
         for g0 in 0:W:G-1
             off = Z1 * (c2 + g0)
-            for j1 in 0:W:N1-1
+            # tiles of W rows j1; when W ∤ N1 the last overlaps the previous
+            # (same task, identical values)
+            for jq in QWin(N1, W)
+                j1 = jq - 1
                 tr = vtranspose(ntuple(g -> vload(Vec{W,T}, zre, off + Z1 * (g - 1) + j1 + 1), Val(W)))
                 ti = vtranspose(ntuple(g -> vload(Vec{W,T}, zim, off + Z1 * (g - 1) + j1 + 1), Val(W)))
                 # row j = a + M1·b goes to slot b + M2·a
@@ -327,8 +397,14 @@ function _fourstep_b!(p::FourStepPlan{T,D}, buf::FsScratch{T}, py::Ptr{T},
             i = vload(Vec{W,T}, cim, G * slot + v + 1) * sc
             lo, hi = interleave_chunks(r, i, Val(1))
             e = c2 + N2 * k1 + v
-            vstore(lo, py + sz * 2e)
-            vstore(hi, py + sz * (2e + W))
+            if lim ≥ G
+                vstore(lo, py + sz * 2e)
+                vstore(hi, py + sz * (2e + W))
+            else
+                # columns past N2 would be the next output row's
+                vstore(lo, py + sz * 2e, _cmask(Val(W), v, lim))
+                vstore(hi, py + sz * (2e + W), _cmask(Val(W), v + W ÷ 2, lim))
+            end
         end
     end
     return nothing

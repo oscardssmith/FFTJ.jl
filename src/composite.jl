@@ -204,6 +204,15 @@ end
 
 plan_nt(q::SplitPlan) = q.nt
 
+# the same algorithm as q on one task
+function _serial_copy(q::SplitPlan{T,D,H}) where {T,D,H}
+    hv = _hvdh_serial_clone(q.hv)
+    return SplitPlan{T,D,H}(q.n, q.p, q.s, hv, [hv], q.stages, q.K, q.hir, q.hii, q.lor,
+                            q.loi, q.lvr, q.lvi, similar(q.xs), [similar(q.yss[1])],
+                            similar(q.are), similar(q.aim), similar(q.bre), similar(q.bim),
+                            1, q.scale)
+end
+
 function _split_gather!(q::SplitPlan, x, jlo::Int, jhi::Int)
     p, s, xs = q.p, q.s, q.xs
     @inbounds for j in jlo:jhi, r in 0:s-1

@@ -15,12 +15,7 @@ end
 # four-step only pays when threaded.)
 serial_like(p::FFTJ.FFTPlan{T,D}) where {T,D} =
     FFTJ._plan(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::FFTJ.FourStepPlan{T,D}) where {T,D} =
-    FFTJ._fourstep(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::FFTJ.HvdhPlan{T,D}) where {T,D} =
-    FFTJ._hvdh(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::FFTJ.SplitPlan{T,D}) where {T,D} =
-    FFTJ._split(T, p.n, D, p.scale; nthreads=1)
+serial_like(p::Union{FFTJ.FourStepPlan,FFTJ.HvdhPlan,FFTJ.SplitPlan}) = FFTJ._serial_copy(p)
 serial_like(p::FFTJ.CompositePlan{T,D}) where {T,D} =
     FFTJ._composite(T, p.n, D, p.scale; nthreads=1)
 serial_like(p::FFTJ.ResamplePlan) = p

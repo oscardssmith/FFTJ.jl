@@ -50,11 +50,13 @@ Pipeline for a 1-D transform of length n:
   fixed: `@inbounds` does not propagate into `ntuple` closures (bounds checks
   cost ~20% at radix 5), and tuple `map`/runtime-length `ntuple` allocate
   past inference limits.
-- **out-of-cache smooth n** (≥ `_fs_min_bytes`: 1.5 MB threaded, 8 MB
-  serial; 7-smooth with a tiling
-  split): two-pass four-step `FourStepPlan` (fourstep.jl), each pass reading
-  and writing the data once, threaded across strips/groups with per-task
-  scratch.
+- **four-step** `FourStepPlan` (fourstep.jl): two passes, each reading and
+  writing the data once, threaded across strips/groups with per-task scratch
+  (two fork-joins per call, so its own task count `_FS_TASK_MIN`). Taken by
+  odd-heavy smooth n (2-part < 4W, from ~2k F64 / ~1k F32 elements, serial or
+  threaded: `_use_ragged`) on a balanced split whose last strip/group may be
+  ragged (masked loads/stores, z padding), and by power-of-two-tiled splits
+  from `_fs_min_bytes` (1 MB threaded, 8 MB serial).
 - **n with larger prime factors** (or small odd-heavy Float32 sizes, see
   `_slow_smooth`): a large smooth factor × a non-smooth one runs as
   `CompositePlan` (composite.jl); odd n ≥ ~1k (F64) / ~16k (F32) as
@@ -133,9 +135,10 @@ Threading (threads.jl; design: docs/superpowers/specs/2026-08-30-fftj-threading-
   non-batched real path has a known pre-existing 32 B/pencil wrapper
   allocation independent of threading.
 - Scaling is bandwidth-bound: direct chains scale ~2–3× on 4 cores while
-  cache-resident. Out-of-cache smooth sizes route to `FourStepPlan` whether
-  threaded or not (measured 4t: 0.5–0.85× threaded direct from 2^20; a
-  three-transpose six-step variant lost to it everywhere and was removed).
+  cache-resident, but they synchronize once per stage, so below ~2^16 they
+  barely gain. Four-step synchronizes twice per call and takes over from 1 MB
+  threaded (odd-heavy sizes from ~2k elements); a three-transpose six-step
+  variant lost to it everywhere and was removed.
   The bitwise threaded==serial tests compare against a same-algorithm serial
   plan (`serial_like` in test/threading.jl).
 - Serial benchmarks of memory-bound sizes swing badly under background load

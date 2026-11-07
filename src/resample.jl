@@ -193,6 +193,10 @@ function _resample(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                                           _plan(T, m, D, one(T); nthreads=1), scale)
 end
 
+# serial already; a copy with its own scratch
+_serial_copy(q::ResamplePlan{T,D,w,WS}) where {T,D,w,WS} =
+    ResamplePlan{T,D,w,WS}(q.n, q.m, q.corr, q.ws, _plan(T, q.m, D, one(T); nthreads=1), q.scale)
+
 # tol is the target error relative to ‖x‖; w defaults to the narrowest
 # multiple of 4 meeting it at the chosen grid ratio
 function _resample_parts(::Type{T}, n::Int, D::Int, scale::T;

@@ -66,7 +66,8 @@ end
         ref = FFTW.fft(ComplexF64.(x))
         # built directly: the larger even sizes route to SplitPlan
         p = FFTJ._resample(T, n, -1)
-        FFTJ._use_split(T, n) || @test plan_fft(T, n) isa FFTJ.ResamplePlan
+        FFTJ._use_split(T, n) || FFTJ._use_ragged(T, n) ||
+            @test plan_fft(T, n) isa FFTJ.ResamplePlan
         y = p(x)
         @test norm(y .- ref) ≤ 100 * eps(T) * norm(ref)
         pinv = FFTJ._resample(T, n, +1)
@@ -93,7 +94,8 @@ end
         FFTJ._use_split(T, n) && @test plan_fft(T, n) isa FFTJ.SplitPlan
         y = p(x)
         @test norm(y .- ref) ≤ 100 * eps(T) * norm(ref)
-        @test FFTJ._split(T, n, -1; nthreads=4)(x) == y   # threaded sub-transforms
+        q4 = FFTJ._split(T, n, -1; nthreads=4)   # threaded sub-transforms
+        @test q4(x) == FFTJ._serial_copy(q4)(x)
         pinv = FFTJ._split(T, n, +1)
         @test norm(pinv(y) .- x) ≤ 100 * eps(T) * norm(x)
         pb = FFTJ._split(T, n, +1, one(T))
@@ -118,10 +120,12 @@ end
         y = p(x)
         @test norm(y .- ref) ≤ 50 * eps(T) * norm(ref)
         @test FFTJ._hvdh(T, n, -1; factors=:fly)(x) ≈ y
-        # threaded (from 65537 at 4 tasks) is bitwise serial, both factor modes
-        @test FFTJ._hvdh(T, n, -1; nthreads=4)(x) == y
-        @test FFTJ._hvdh(T, n, -1; factors=:fly, nthreads=4)(x) ==
-              FFTJ._hvdh(T, n, -1; factors=:fly, nthreads=1)(x)
+        # threaded (from 65537 at 4 tasks) is bitwise its serial copy, both
+        # factor modes (the inner transform's routing may differ from nthreads=1)
+        for f in (:auto, :fly)
+            p4 = FFTJ._hvdh(T, n, -1; factors=f, nthreads=4)
+            @test p4(x) == FFTJ._serial_copy(p4)(x)
+        end
         pinv = FFTJ._hvdh(T, n, +1)
         @test norm(pinv(y) .- x) ≤ 50 * eps(T) * norm(x)
         y2 = similar(x)
@@ -198,6 +202,31 @@ end
             r = D == -1 ? ref : FFTW.ifft(ComplexF64.(x))
             @test norm(p(x) .- r) ≤ 50 * eps(T) * norm(r)
         end
+    end
+end
+
+@testset "ragged four-step (odd-heavy n) vs FFTW ($T)" for T in (Float32, Float64)
+    rng = Xoshiro(0x7a6)
+    # neither factor a multiple of W (ragged strips and groups), 11/13
+    # factors, a 2-part below 4W, and a mixed size with a ragged split
+    ns = [3^8, 5^6, 7^5, 3^4 * 11 * 13, 13^4, 2 * 3^9, 2835, 3^10 * 2, 1000]
+    @testset "n = $n" for n in ns
+        sp = FFTJ._fourstep_split(T, n, 1)
+        sp === nothing && continue
+        x = randn(rng, Complex{T}, n)
+        ref = FFTW.fft(ComplexF64.(x))
+        p = FFTJ._fourstep(T, n, -1; nthreads=1)
+        FFTJ._use_ragged(T, n) && @test plan_fft(T, n) isa FFTJ.FourStepPlan
+        y = p(x)
+        @test norm(y .- ref) ≤ 50 * eps(T) * norm(ref)
+        @test FFTJ._fourstep(T, n, -1; nthreads=4)(x) == y   # bitwise serial
+        pinv = FFTJ._fourstep(T, n, +1)
+        @test norm(pinv(y) .- x) ≤ 50 * eps(T) * norm(x)
+        pb = FFTJ._fourstep(T, n, +1, one(T))
+        @test norm(pb(y) .- n .* x) ≤ 50 * eps(T) * n * norm(x)
+        y2 = similar(x)
+        p(y2, x)
+        @test (@allocated p(y2, x)) == 0
     end
 end
 
@@ -360,22 +389,28 @@ end
 end
 
 @testset "smooth-size routing" begin
-    # Float64: direct chains win at every smooth size, including 11/13 radices
-    for n in (405, 2835, 3^8, 3^12, 2 * 3^6 * 5^2 * 7^2, 11 * 1024, 13^3)
-        @test plan_fft(Float64, n) isa FFTJ.FFTPlan
+    # direct chains for small sizes and a sizable 2-part (11/13 radices too)
+    for n in (405, 11 * 1024, 4000)
+        @test plan_fft(Float64, n; nthreads=1) isa FFTJ.FFTPlan
     end
-    # four-step from 1.5 MB threaded, 8 MB serial
+    @test plan_fft(Float32, 8000; nthreads=1) isa FFTJ.FFTPlan
+    # odd-heavy sizes from ~2k (F64) / ~1k (F32): ragged four-step, serial too
+    for n in (2835, 3^8, 3^12, 2 * 3^6 * 5^2 * 7^2, 13^3)
+        @test plan_fft(Float64, n; nthreads=1) isa FFTJ.FourStepPlan
+    end
+    # tiled four-step from 1 MB threaded, 8 MB serial
     @test plan_fft(Float64, 2^18; nthreads=1) isa FFTJ.FFTPlan
     @test plan_fft(Float64, 2^19; nthreads=1) isa FFTJ.FourStepPlan
-    @test plan_fft(Float64, 2^18; nthreads=4) isa FFTJ.FourStepPlan
+    @test plan_fft(Float64, 2^16; nthreads=4) isa FFTJ.FourStepPlan
+    @test plan_fft(Float64, 2^15; nthreads=4) isa FFTJ.FFTPlan
     # non-smooth routes to resampling (large odd n: HvdH)
     @test plan_fft(Float64, 10006) isa FFTJ.ResamplePlan
     @test plan_fft(Float64, 10007) isa FFTJ.HvdhPlan
     @test plan_fft(Float32, 10007) isa FFTJ.ResamplePlan
-    # Float32: small odd-heavy sizes resample, larger ones run direct
+    # Float32: small odd-heavy sizes resample, larger ones ragged four-step
     @test plan_fft(Float32, 729) isa FFTJ.ResamplePlan
-    @test plan_fft(Float32, 3^12) isa FFTJ.FFTPlan
-    @test plan_fft(Float32, 2 * 3^6 * 5^2 * 7^2) isa FFTJ.FFTPlan
+    @test plan_fft(Float32, 2187) isa FFTJ.FourStepPlan
+    @test plan_fft(Float32, 3^12) isa FFTJ.FourStepPlan
 end
 
 include("threading.jl")
