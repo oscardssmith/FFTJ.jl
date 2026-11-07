@@ -188,16 +188,22 @@ _fs_tiled(::Type{T}, n::Int, (N1, N2)) where {T} =
 @inline _cmask(::Val{W}, base::Int, lim::Int) where {W} =
     Vec{W,Int}(ntuple(f -> (f - 1) >> 1, Val(W))) + base < lim
 
-# Smallest complex-data size routed to a tiled (power-of-two) four-step.
-# Threaded (four-step's own task count), parity with the threaded direct
-# chain near 1 MB in both precisions. Serial, direct stays 10-20% ahead up
-# to 4 MB (A/B vs main, every run agreeing) and ties at 8 MB.
-_fs_min_bytes(threaded::Bool) = threaded ? 1 << 20 : 8 << 20
+# Smallest complex-data size routed to a tiled four-step, at the measured
+# parity with the direct chain. With 1-vector strips: threaded ~1 MB, serial
+# ~8 MB (direct 10-20% ahead up to 4 MB). Wider strips (_fs_width > 1) move
+# both down: threaded ~0.5 MB (F64 0.99, F32 0.83), serial ~3 MB F64 (0.99;
+# 0.80-0.93 from 4 MB) and ~5 MB F32 (4 MB 1.07, 6 MB 0.88).
+function _fs_min_bytes(::Type{T}, threaded::Bool, wide::Bool) where {T}
+    wide || return threaded ? 1 << 20 : 8 << 20
+    threaded && return 1 << 19
+    return sizeof(T) ≥ 8 ? 3 << 20 : 5 << 20
+end
 
 function _use_fourstep(::Type{T}, n::Int, threaded::Bool) where {T}
-    2 * n * sizeof(T) ≥ _fs_min_bytes(threaded) || return false
     sp = _fourstep_split(T, n, 1)
-    return sp !== nothing && _fs_tiled(T, n, sp)
+    (sp !== nothing && _fs_tiled(T, n, sp)) || return false
+    wide = _fs_width(T, sp[2], sp[1]) > 1
+    return 2 * n * sizeof(T) ≥ _fs_min_bytes(T, threaded, wide)
 end
 
 # Smooth n without a tiled split that run a balanced ragged four-step:

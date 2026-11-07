@@ -57,7 +57,8 @@ Pipeline for a 1-D transform of length n:
   a 2-part of 4W from 16k; any non-tiled n from 2^15 when threaded:
   `_use_ragged`) on a balanced split whose last strip/group may be
   ragged (masked loads/stores, z padding), and by power-of-two-tiled splits
-  from `_fs_min_bytes` (1 MB threaded, 8 MB serial).
+  from `_fs_min_bytes` (with 2-vector strips from `_fs_width`: 0.5 MB
+  threaded, 3 MB F64 / 5 MB F32 serial; with 1-vector strips 1 MB / 8 MB).
 - **n with larger prime factors** (or small odd-heavy Float32 sizes, see
   `_slow_smooth`): a large smooth factor × a non-smooth one runs as
   `CompositePlan` (composite.jl); odd n ≥ ~1k (F64) / ~16k (F32) as

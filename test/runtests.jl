@@ -403,11 +403,11 @@ end
     @test plan_fft(Float64, 12000; nthreads=1) isa FFTJ.FFTPlan
     @test plan_fft(Float32, 40000; nthreads=1) isa FFTJ.FFTPlan
     @test plan_fft(Float32, 40000; nthreads=4) isa FFTJ.FourStepPlan
-    # tiled four-step from 1 MB threaded, 8 MB serial
-    @test plan_fft(Float64, 2^18; nthreads=1) isa FFTJ.FFTPlan
-    @test plan_fft(Float64, 2^19; nthreads=1) isa FFTJ.FourStepPlan
-    @test plan_fft(Float64, 2^16; nthreads=4) isa FFTJ.FourStepPlan
-    @test plan_fft(Float64, 2^15; nthreads=4) isa FFTJ.FFTPlan
+    # tiled four-step with wide strips: from 0.5 MB threaded, 3 MB serial (F64)
+    @test plan_fft(Float64, 2^17; nthreads=1) isa FFTJ.FFTPlan
+    @test plan_fft(Float64, 2^18; nthreads=1) isa FFTJ.FourStepPlan
+    @test plan_fft(Float64, 2^15; nthreads=4) isa FFTJ.FourStepPlan
+    @test plan_fft(Float64, 2^14; nthreads=4) isa FFTJ.FFTPlan
     # non-smooth routes to resampling (large odd n: HvdH)
     @test plan_fft(Float64, 10006) isa FFTJ.ResamplePlan
     @test plan_fft(Float64, 10007) isa FFTJ.HvdhPlan
