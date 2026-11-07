@@ -25,11 +25,22 @@ struct NdPlan{T,D,N}
     fuse_in::Bool              # first pass's first stage reads interleaved input
     fuse_out::Bool             # last pass's final stage writes interleaved output
     dim1_batched::Bool         # dim 1 runs transposed with pencils as lanes
+    fs2::Union{Nothing,Fs2Plan{T,D}}   # large 2-D: two-pass path instead of the passes
     nt::Int                    # task count for execution (1 = serial, zero-alloc)
     scale::T
 end
 
 plan_nt(p::NdPlan) = p.nt
+
+# the same algorithm as p on one task (the two-pass 2-D path is threaded-only,
+# so plan_*(x; nthreads=1) need not be)
+function _serial_copy(p::NdPlan{T,D,N}) where {T,D,N}
+    q = _ndplan(T, p.dims, D, p.scale; nthreads=1)
+    p.fs2 === nothing && return q
+    return NdPlan{T,D,N}(q.dims, q.len, q.passes, q.are, q.aim, q.bre, q.bim, q.fuse_in,
+                         q.fuse_out, q.dim1_batched,
+                         _fs2(T, p.dims..., D, p.scale; nthreads=1), 1, q.scale)
+end
 
 # would a per-pencil chain of length n get the fast fused-edge 1-D treatment?
 function pencil_fused(::Type{T}, n::Int, stages::Vector{Stage{T}}) where {T}
@@ -98,10 +109,12 @@ function _ndplan(::Type{T}, dims::NTuple{N,Int}, D::Int, scale::T;
             fuse_in = false
         end
     end
+    fs2 = N == 2 && first_dim == 1 && _use_fs2(T, dims..., nt > 1) ?
+          _fs2(T, dims..., D, scale; nthreads) : nothing
     return NdPlan{T,D,N}(dims, len, passes,
                          Vector{T}(undef, len), Vector{T}(undef, len),
                          Vector{T}(undef, len), Vector{T}(undef, len),
-                         fuse_in, fuse_out, dim1_batched, nt, scale)
+                         fuse_in, fuse_out, dim1_batched, fs2, nt, scale)
 end
 
 # transpose both planes from (cre,cim) into (ore,oim); returns the roles
@@ -147,6 +160,8 @@ function _exec_nd!(p::NdPlan{T,D,N}, y::AbstractArray{Complex{T}},
         y .= p.scale .* x
         return y
     end
+    fs2 = p.fs2
+    fs2 === nothing || return fs2(y, x)
     GC.@preserve x y begin
         px = _rawptr(x)
         py = _rawptr(y)

@@ -15,7 +15,8 @@ end
 # four-step only pays when threaded.)
 serial_like(p::FFTJ.FFTPlan{T,D}) where {T,D} =
     FFTJ._plan(T, p.n, D, p.scale; nthreads=1)
-serial_like(p::Union{FFTJ.FourStepPlan,FFTJ.HvdhPlan,FFTJ.SplitPlan}) = FFTJ._serial_copy(p)
+serial_like(p::Union{FFTJ.FourStepPlan,FFTJ.HvdhPlan,FFTJ.SplitPlan,FFTJ.NdPlan}) =
+    FFTJ._serial_copy(p)
 serial_like(p::FFTJ.CompositePlan{T,D}) where {T,D} =
     FFTJ._composite(T, p.n, D, p.scale; nthreads=1)
 serial_like(p::FFTJ.ResamplePlan) = p
@@ -117,32 +118,32 @@ end
 
 @testset "threaded N-d complex vs serial ($T)" for T in (Float32, Float64)
     rng = Xoshiro(0xd7d)
-    # (1024,512): block-parallel passes; (2^16,4): last dim has Bo=1 → intra-
-    # stage; (4,2^16): dim-1 batched-transposed chain; (513,255): both dims
-    # non-smooth → batched resampling passes; (256,33,17): 3-d mixed
+    # (1024,512): two-pass 2-D path when threaded; (2^16,4): last dim has
+    # Bo=1 → intra-stage; (4,2^16): dim-1 batched-transposed chain; (513,255):
+    # both dims non-smooth → batched resampling passes; (256,33,17): 3-d mixed
     shapes = [(1024, 512), (2^16, 4), (4, 2^16), (513, 255), (256, 33, 17)]
     @testset "dims = $dims" for dims in shapes
         x = randn(rng, Complex{T}, dims)
         p1 = plan_fft(x; nthreads=1)
         pt = plan_fft(x)
         Threads.nthreads() > 1 && @test FFTJ.plan_nt(pt) > 1
-        y1 = p1 * x
         yt = pt * x
-        @test yt == y1                    # bitwise-identical to serial
+        @test yt == serial_like(pt) * x   # bitwise-identical to same-algorithm serial
         @test pt * x == yt                # deterministic across executions
         ref = FFTW.fft(ComplexF64.(x))
         @test norm(vec(yt) .- vec(ref)) ≤ 200 * eps(T) * norm(vec(ref))
+        @test norm(vec(p1 * x) .- vec(ref)) ≤ 200 * eps(T) * norm(vec(ref))
 
-        @test plan_ifft(x) * yt == plan_ifft(x; nthreads=1) * yt
-        @test norm(vec(plan_ifft(x) * yt) .- vec(x)) ≤ 200 * eps(T) * norm(vec(x))
-        @test plan_bfft(x) * yt == plan_bfft(x; nthreads=1) * yt
+        pi_ = plan_ifft(x)
+        @test pi_ * yt == serial_like(pi_) * yt
+        @test norm(vec(pi_ * yt) .- vec(x)) ≤ 200 * eps(T) * norm(vec(x))
+        pb = plan_bfft(x)
+        @test pb * yt == serial_like(pb) * yt
 
         # in-place plans thread identically
         w = copy(x)
-        w1 = copy(x)
         plan_fft!(x) * w
-        plan_fft!(x; nthreads=1) * w1
-        @test w == w1
+        @test w == yt
 
         # nthreads=1 N-d plan execution stays allocation-free
         z = similar(x)

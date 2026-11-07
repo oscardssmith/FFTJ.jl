@@ -313,9 +313,10 @@ end
 
 # pass A, strips slo..shi: per strip of S columns j1 = c..c+S-1, gather rows
 # j2, transform over j2, twiddle by ω^{j1·k2} = ω^{c·k2}·ω^{l·k2} and store
-# into z
+# into z. Without the twiddle (TW = false) this is the strided pass of a 2-D
+# N1×N2 transform (Fs2Plan).
 function _fourstep_a!(p::FourStepPlan{T,D}, buf::FsScratch{T}, px::Ptr{T},
-                      slo::Int, shi::Int) where {T,D}
+                      slo::Int, shi::Int, ::Val{TW}=Val(true)) where {T,D,TW}
     W = pick_width(T)
     sz = sizeof(T)
     N1, N2, S, K = p.N1, p.N2, p.S, p.K
@@ -345,6 +346,13 @@ function _fourstep_a!(p::FourStepPlan{T,D}, buf::FsScratch{T}, px::Ptr{T},
         for b in 0:M2-1, a in 0:M1-1
             k2 = b + M2 * a
             slot = a + P1 * b
+            if !TW
+                for v in 1:W:S
+                    vstore(vload(Vec{W,T}, cre, S * slot + v), zre, c + Z1 * k2 + v)
+                    vstore(vload(Vec{W,T}, cim, S * slot + v), zim, c + Z1 * k2 + v)
+                end
+                continue
+            end
             hi, lo = divrem(c * k2, K)
             ar = p.hir[hi+1] * p.lor[lo+1] - p.hii[hi+1] * p.loi[lo+1]
             ai = p.hir[hi+1] * p.loi[lo+1] + p.hii[hi+1] * p.lor[lo+1]
@@ -420,6 +428,77 @@ function _fourstep_b!(p::FourStepPlan{T,D}, buf::FsScratch{T}, py::Ptr{T},
                 vstore(hi, py + sz * (2e + W), _cmask(Val(W), v + W ÷ 2, lim))
             end
         end
+    end
+    return nothing
+end
+
+# A 2-D n1×n2 transform (dim 1 contiguous) is a four-step without the
+# twiddle: pass A transforms strips of the strided dim 2 straight from the
+# interleaved input into z, pass B transforms each contiguous row of z and
+# writes interleaved output from its fused final stage. Each pass reads and
+# writes memory once, where per-stage strided passes sweep it once per stage.
+struct Fs2Plan{T,D}
+    fs::FourStepPlan{T,D}      # pass A strips, z and per-task scratch (N1 = n1, N2 = n2)
+    rows::Vector{Stage{T}}     # length-n1 chain, small-stride first stage
+    scale::T
+end
+
+# Smallest complex-data size given the two-pass 2-D path
+const _FS2_MIN_BYTES = 1 << 20
+
+# Threaded only: it trades per-stage sweeps and syncs for two of each, which
+# pays when threads contend for bandwidth (4t F64: 0.61-0.92 from 256²) but
+# not on one core (0.98-1.30). And only while pass A's strips don't nest (the
+# strided dim n2 is fixed, unlike four-step's capped N2): 4096² nested 1.02-1.30.
+function _use_fs2(::Type{T}, n1::Int, n2::Int, threaded::Bool) where {T}
+    threaded || return false
+    2 * n1 * n2 * sizeof(T) ≥ _FS2_MIN_BYTES || return false
+    4 * pick_width(T) * n2 * sizeof(T) ≤ _FS_INNER_MAX || return false
+    _fourstep_split(T, n1 * n2, 1, n2) === nothing && return false
+    # pass B's rows end in a fused power-of-two stage writing interleaved output
+    f = last(build_stages_cached(T, n1, -1))
+    return f in (2, 4, 8) && n1 ÷ f ≥ pick_width(T)
+end
+
+function _fs2(::Type{T}, n1::Int, n2::Int, D::Int, scale::T;
+              nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
+    fs = _fourstep(T, n1 * n2, D, one(T); N2=n2, nthreads)
+    rows, _ = build_stages_cached(T, n1, D)
+    return Fs2Plan{T,D}(fs, rows, scale)
+end
+
+function (p::Fs2Plan{T,D})(y::AbstractArray{Complex{T}}, x::AbstractArray{Complex{T}}) where {T,D}
+    fs = p.fs
+    na, n2 = cld(fs.N1, fs.S), fs.N2
+    GC.@preserve x y begin
+        px, py = _rawptr(x), _rawptr(y)
+        if fs.nt > 1
+            tforeach_chunks((ci, lo, hi) -> _fourstep_a!(fs, fs.ws[ci], px, lo, hi, Val(false)),
+                            na, fs.nt)
+            tforeach_chunks((ci, lo, hi) -> _fs2_rows!(p, fs.ws[ci], py, lo - 1, hi - 1),
+                            n2, fs.nt)
+        else
+            _fourstep_a!(fs, fs.ws[1], px, 1, na, Val(false))
+            _fs2_rows!(p, fs.ws[1], py, 0, n2 - 1)
+        end
+    end
+    return y
+end
+
+# pass B, rows rlo..rhi of z: the length-n1 chain in place on the row (with
+# the task's scratch as ping-pong partner), its final stage writing y's row
+function _fs2_rows!(p::Fs2Plan{T,D}, buf::FsScratch{T}, py::Ptr{T}, rlo::Int, rhi::Int) where {T,D}
+    fs = p.fs
+    n1, Z1 = fs.N1, fs.Z1
+    f = p.rows[end].radix
+    chain = view(p.rows, 1:length(p.rows)-1)
+    br, bi = view(buf.bre, 1:n1), view(buf.bim, 1:n1)
+    sz = sizeof(T)
+    @inbounds for k2 in rlo:rhi
+        rng = Z1*k2+1:Z1*k2+n1
+        cre, cim, _, _ = run_chain!(view(fs.zre, rng), view(fs.zim, rng), br, bi, chain,
+                                    n1, 1, 1, Val(D))
+        run_last_stage!(py + 2sz * n1 * k2, cre, cim, n1 ÷ f, f, p.scale, Val(D))
     end
     return nothing
 end
