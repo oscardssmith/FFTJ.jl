@@ -139,24 +139,19 @@ end
 plan_nt(p::FourStepPlan) = p.nt
 
 # (N1, N2) with both factors chain-buildable and at least one strip wide, or
-# nothing. With N2 = 0: for a 7-smooth n whose split tiles into width·W
-# strips, a balanced power-of-two N2 (the odd part goes to N1), capped so
-# pass A doesn't nest: one nested pass measured ~20% faster than two; the cap
-# stops at half balanced so pass B's buffers keep growing as √n. Otherwise
-# the most balanced split (N2 ≤ √n); its last strip and group may be ragged.
+# nothing. With N2 = 0, N2 is the divisor nearest t ≈ √n, capped at nflat so
+# pass A doesn't nest (one nested pass measured ~20% faster than two) but
+# never below half balanced, so pass B's buffers keep growing as √n. A split
+# whose factors both tile into width·W strips is preferred within 2× of t;
+# otherwise the nearest buildable split, whose last strip/group is ragged.
 function _fourstep_split(::Type{T}, n::Int, width::Int, N2::Int=0) where {T}
     W = pick_width(T)
     W > 1 || return nothing
     S = width * W
     if N2 == 0
-        fac = factor_smooth(n)
-        if fac !== nothing
-            nflat = _FS_INNER_MAX ÷ (4 * width * W * sizeof(T))
-            Nb = 1 << (fac[1] ÷ 2)
-            P2 = max(min(Nb, prevpow(2, max(nflat, W))), Nb ÷ 2)
-            n % P2 == 0 && (n ÷ P2) % S == 0 && P2 % S == 0 && return (n ÷ P2, P2)
-        end
-        N2 = _fs_balanced(n, S)
+        r = isqrt(n)
+        nflat = _FS_INNER_MAX ÷ (4 * width * W * sizeof(T))
+        N2 = _fs_pick(n, S, max(min(r, nflat), r ÷ 2))
         N2 == 0 && return nothing
     end
     N1 = n ÷ N2
@@ -165,18 +160,28 @@ function _fourstep_split(::Type{T}, n::Int, width::Int, N2::Int=0) where {T}
     return ok ? (N1, N2) : nothing
 end
 
-# largest divisor N2 ≤ √n with both factors chain-buildable and ≥ S, or 0
-function _fs_balanced(n::Int, S::Int)
-    for d in isqrt(n):-1:S
-        n % d == 0 || continue
-        factor_radices(d) !== nothing && factor_radices(n ÷ d) !== nothing && return d
+# divisor of n nearest t (ties: the smaller), both factors buildable and ≥ S;
+# a tiling one (both factors multiples of S) within 2× of t first, else any
+function _fs_pick(n::Int, S::Int, t::Int)
+    best = besttile = 0
+    dist(d) = abs(log(d / t))
+    for q in 1:isqrt(n)
+        n % q == 0 || continue
+        for d in (q, n ÷ q)
+            (d ≥ S && n ÷ d ≥ S) || continue
+            (factor_radices(d) === nothing || factor_radices(n ÷ d) === nothing) && continue
+            better(b) = b == 0 || dist(d) < dist(b) || (dist(d) == dist(b) && d < b)
+            better(best) && (best = d)
+            d % S == 0 && (n ÷ d) % S == 0 && dist(d) ≤ log(2) && better(besttile) &&
+                (besttile = d)
+        end
     end
-    return 0
+    return besttile != 0 ? besttile : best
 end
 
-# the default split is the power-of-two one (both factors tile into strips)
+# both factors tile into W-wide strips (no ragged strip or group)
 _fs_tiled(::Type{T}, n::Int, (N1, N2)) where {T} =
-    N1 % pick_width(T) == 0 && N2 % pick_width(T) == 0 && ispow2(N2)
+    N1 % pick_width(T) == 0 && N2 % pick_width(T) == 0
 
 # Vec{W,Bool} for W floats of interleaved complex data: complex lanes
 # base .. base + W/2 - 1, valid below lim

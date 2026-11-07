@@ -96,24 +96,15 @@ end
 
 default_scale(::Type{T}, n, D) where {T} = D == -1 ? one(T) : one(T) / n
 
-# twiddled radix-8 stages in the power-of-two tower (a const so A/B runs can
-# redefine it and rebuild)
-const _RADIX8_TOWER = true
-
 # (final radix f, tower radices) for a power-of-two part 2^a, the final stage
 # being the last radix of the chain. Sizes first: a 1-D chain reserves k
 # leading radix-4 stages until its stride reaches W (small-stride and
 # fused-input layouts are radix-4 only); the other b bits take as many radix
 # 8s as possible (b mod 3 = 2: one radix 4, = 1: two). Then the order: radix
 # 4s first, radix 8s last, so a radix 8 lands on the twiddle-free final stage.
-# Without radix-8 towers: all radix 4 with a final 2/4/8.
 function _tower(::Type{T}, a::Int, allow_small::Bool) where {T}
     a == 0 && return 1, Int[]
     a ≤ 3 && return 1 << a, Int[]
-    if !_RADIX8_TOWER
-        f = isodd(a) ? 8 : 4
-        return f, fill(4, (a - trailing_zeros(f)) ÷ 2)
-    end
     W = pick_width(T)
     k = 0
     while allow_small && 4^k < W && 2(k + 1) ≤ a - 2   # leave ≥ 2 bits after
