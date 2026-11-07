@@ -166,7 +166,8 @@ end
 
 @testset "four-step (out-of-cache n) vs FFTW ($T)" for T in (Float32, Float64)
     rng = Xoshiro(0x4573)
-    ns = filter(n -> FFTJ._use_fourstep(T, n),
+    # threaded routing reaches four-step at test-friendly sizes
+    ns = filter(n -> FFTJ._use_fourstep(T, n, true),
                 [2^17, 2^18, 2^20, 3 * 2^16, 5 * 2^16, 7 * 2^16, 9 * 2^15, 15 * 2^15])
     @test length(ns) ≥ 6
     @testset "n = $n" for n in ns
@@ -363,6 +364,10 @@ end
     for n in (405, 2835, 3^8, 3^12, 2 * 3^6 * 5^2 * 7^2, 11 * 1024, 13^3)
         @test plan_fft(Float64, n) isa FFTJ.FFTPlan
     end
+    # four-step from 1.5 MB threaded, 8 MB serial
+    @test plan_fft(Float64, 2^18; nthreads=1) isa FFTJ.FFTPlan
+    @test plan_fft(Float64, 2^19; nthreads=1) isa FFTJ.FourStepPlan
+    @test plan_fft(Float64, 2^18; nthreads=4) isa FFTJ.FourStepPlan
     # non-smooth routes to resampling (large odd n: HvdH)
     @test plan_fft(Float64, 10006) isa FFTJ.ResamplePlan
     @test plan_fft(Float64, 10007) isa FFTJ.HvdhPlan

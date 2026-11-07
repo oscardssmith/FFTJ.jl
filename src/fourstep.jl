@@ -157,12 +157,13 @@ function _fourstep_split(::Type{T}, n::Int, width::Int, N2::Int=0) where {T}
     return ok ? (N1, N2) : nothing
 end
 
-# Smallest complex-data size routed to four-step: measured slower at 1 MB
-# and faster at 2 MB in both precisions.
-const _FS_MIN_BYTES = 3 << 19
+# Smallest complex-data size routed to four-step. Threaded, parity with the
+# threaded direct chain near 1.5 MB. Serial, direct stays 10-20% ahead up
+# to 4 MB in both precisions (A/B vs main, every run agreeing) and ties at 8 MB.
+_fs_min_bytes(threaded::Bool) = threaded ? 3 << 19 : 8 << 20
 
-_use_fourstep(::Type{T}, n::Int) where {T} =
-    2 * n * sizeof(T) ≥ _FS_MIN_BYTES && _fourstep_split(T, n, 1) !== nothing
+_use_fourstep(::Type{T}, n::Int, threaded::Bool) where {T} =
+    2 * n * sizeof(T) ≥ _fs_min_bytes(threaded) && _fourstep_split(T, n, 1) !== nothing
 
 function _fourstep(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
                    N2::Int=0, width::Int=1, zpad::Int=pick_width(T),

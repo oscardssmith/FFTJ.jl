@@ -180,7 +180,8 @@ function _anyplan(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
         return _resample(T, n, D, scale)
     end
     _slow_smooth(T, n) && return _resample(T, n, D, scale)
-    _use_fourstep(T, n) && return _fourstep(T, n, D, scale; nthreads)
+    _use_fourstep(T, n, plan_tasks(n, nthreads) > 1) &&
+        return _fourstep(T, n, D, scale; nthreads)
     return _plan(T, n, D, scale; nthreads)
 end
 plan_fft(::Type{T}, n::Integer; nthreads::Integer=Threads.nthreads()) where {T<:AbstractFloat} =

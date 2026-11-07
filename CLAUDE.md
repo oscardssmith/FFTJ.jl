@@ -50,7 +50,8 @@ Pipeline for a 1-D transform of length n:
   fixed: `@inbounds` does not propagate into `ntuple` closures (bounds checks
   cost ~20% at radix 5), and tuple `map`/runtime-length `ntuple` allocate
   past inference limits.
-- **out-of-cache smooth n** (≥ `_FS_MIN_BYTES`, 7-smooth with a tiling
+- **out-of-cache smooth n** (≥ `_fs_min_bytes`: 1.5 MB threaded, 8 MB
+  serial; 7-smooth with a tiling
   split): two-pass four-step `FourStepPlan` (fourstep.jl), each pass reading
   and writing the data once, threaded across strips/groups with per-task
   scratch.
