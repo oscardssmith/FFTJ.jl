@@ -32,8 +32,8 @@ end
 
 plan_nt(p::NdPlan) = p.nt
 
-# the same algorithm as p on one task (the two-pass 2-D path is threaded-only,
-# so plan_*(x; nthreads=1) need not be)
+# the same algorithm as p on one task (the two-pass 2-D path has different
+# serial and threaded thresholds, so plan_*(x; nthreads=1) need not be)
 function _serial_copy(p::NdPlan{T,D,N}) where {T,D,N}
     q = _ndplan(T, p.dims, D, p.scale; nthreads=1)
     p.fs2 === nothing && return q

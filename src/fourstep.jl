@@ -225,15 +225,36 @@ end
 # much smaller sizes than direct chains: one task per this many elements
 const _FS_TASK_MIN = 1 << 13
 
+# Strip width in vectors: the smallest giving strided rows of ≥ 256 bytes
+# (128-byte rows at a page stride cost 2.3× their traffic; 256 vs 512 bytes
+# barely differ), narrowed until the strip buffers (4 planes of S lanes ×
+# each pass length) fit the cache budget. N1 > 0: a 1-D split, whose factors
+# must also tile at that width; N1 = 0: only pass A's length N2 (2-D rows).
+# Measured w = 2 vs 1: 2-D 0.79-0.98 (one noisy 1.15), 1-D 2^20 0.73-0.84.
+function _fs_width(::Type{T}, N2::Int, N1::Int=0) where {T}
+    W = pick_width(T)
+    w = max(1, cld(256, 2 * W * sizeof(T)))
+    fits(w) = 4 * w * W * max(N1, N2) * sizeof(T) ≤ _FS_INNER_MAX &&
+              (N1 == 0 || (N1 % (w * W) == 0 && N2 % (w * W) == 0))
+    while w > 1 && !fits(w)
+        w -= 1
+    end
+    return w
+end
+
+# width = 0: split as for width 1, then widen by _fs_width (a wider strip
+# never changes the split: halving four-step's N2 cap cost 2^22 1.10-1.13×)
 function _fourstep(::Type{T}, n::Int, D::Int, scale::T=default_scale(T, n, D);
-                   N2::Int=0, width::Int=1, zpad::Int=pick_width(T),
+                   N2::Int=0, width::Int=0, zpad::Int=0,
                    ipad::Int=1, nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
     W = pick_width(T)
-    split = _fourstep_split(T, n, width, N2)
+    split = _fourstep_split(T, n, max(width, 1), N2)
     split === nothing &&
-        throw(ArgumentError("no four-step split of $n tiles into width-$(width * W) strips"))
+        throw(ArgumentError("no four-step split of $n tiles into width-$(max(width, 1) * W) strips"))
     N1, N2 = split
+    width == 0 && (width = _fs_width(T, N2, N1))
     S = G = width * W
+    zpad == 0 && (zpad = S)
     Tw = promote_type(T, Float64)
     ω(e) = sincospi(Tw(2 * D * e) / n)   # (sin, cos) of the angle of ω^e
     R = 1 << (trailing_zeros(N2) ÷ 2)
@@ -446,13 +467,16 @@ end
 # Smallest complex-data size given the two-pass 2-D path
 const _FS2_MIN_BYTES = 1 << 20
 
-# Threaded only: it trades per-stage sweeps and syncs for two of each, which
-# pays when threads contend for bandwidth (4t F64: 0.61-0.92 from 256²) but
-# not on one core (0.98-1.30). And only while pass A's strips don't nest (the
-# strided dim n2 is fixed, unlike four-step's capped N2): 4096² nested 1.02-1.30.
+# Threaded from 1 MB: two sweeps and syncs instead of one per stage pay when
+# threads contend for bandwidth (4t F64: 0.61-0.92 from 256²). Serial from
+# 4 MB with whole strips (strip width from _fs_width): 0.81-0.96, but 1.05-1.06
+# at 1-2 MB and 1.15 for F32 1000² (32-wide strips, the last 8 used). Only
+# while pass A's strips don't nest (the strided dim n2 is fixed, unlike
+# four-step's capped N2): 4096² nested 1.02-1.30.
 function _use_fs2(::Type{T}, n1::Int, n2::Int, threaded::Bool) where {T}
-    threaded || return false
-    2 * n1 * n2 * sizeof(T) ≥ _FS2_MIN_BYTES || return false
+    bytes = 2 * n1 * n2 * sizeof(T)
+    bytes ≥ (threaded ? _FS2_MIN_BYTES : 4_FS2_MIN_BYTES) || return false
+    threaded || n1 % (_fs_width(T, n2) * pick_width(T)) == 0 || return false
     4 * pick_width(T) * n2 * sizeof(T) ≤ _FS_INNER_MAX || return false
     _fourstep_split(T, n1 * n2, 1, n2) === nothing && return false
     # pass B's rows end in a fused power-of-two stage writing interleaved output
@@ -462,7 +486,7 @@ end
 
 function _fs2(::Type{T}, n1::Int, n2::Int, D::Int, scale::T;
               nthreads::Int=Threads.nthreads()) where {T<:AbstractFloat}
-    fs = _fourstep(T, n1 * n2, D, one(T); N2=n2, nthreads)
+    fs = _fourstep(T, n1 * n2, D, one(T); N2=n2, width=_fs_width(T, n2), nthreads)
     rows, _ = build_stages_cached(T, n1, D)
     return Fs2Plan{T,D}(fs, rows, scale)
 end
