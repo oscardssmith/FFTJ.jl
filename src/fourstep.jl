@@ -51,11 +51,17 @@ function _inner_fourstep(::Type{T}, N::Int, L::Int, D::Int, pad::Int) where {T}
         twr[j1+M1*k2+1] = T(c)
         twi[j1+M1*k2+1] = T(s)
     end
+    ns = min(_FS_NEST_TILE, M1) * L * M2
     return InnerFourStep{T}(N, L, M1, M2, M1 + pad,
                             first(build_stages_cached(T, M2, D; allow_small=false)),
                             first(build_stages_cached(T, M1, D; allow_small=false)),
-                            twr, twi, Vector{T}(undef, L * M2), Vector{T}(undef, L * M2))
+                            twr, twi, Vector{T}(undef, ns), Vector{T}(undef, ns))
 end
+
+# first transforms per tile of the nested twiddle/permute copy: its stores of
+# a tile's blocks into each slot row k2 are one contiguous run, where single
+# blocks scattered L-lane rows P1·L apart (store-buffer bound)
+const _FS_NEST_TILE = 8
 
 # length-N transform of the L-lane rows in (are, aim) laid out per
 # _lanes_geom, using (bre, bim) as scratch; returns the planes holding the
@@ -67,19 +73,32 @@ end
 function _lanes_fft!(q::InnerFourStep{T}, stages, are, aim, bre, bim, N, L, d::Val) where {T}
     W = pick_width(T)
     M1, M2, P1 = q.M1, q.M2, q.P1
-    sre, sim = view(q.sre, 1:L*M2), view(q.sim, 1:L*M2)
-    @inbounds for j1 in 0:M1-1
-        blk = L*M2*j1+1:L*M2*(j1+1)
-        cre, cim, _, _ = run_chain!(view(are, blk), view(aim, blk), sre, sim,
-                                    q.stA, M2, 1, L, d)
-        for k2 in 0:M2-1
+    LM = L * M2
+    tl = min(_FS_NEST_TILE, M1)
+    # every block takes the same stages, so the first transforms' results
+    # all land in the scratch slices (odd count) or all in place
+    inscratch = isodd(length(q.stA))
+    sr, si = inscratch ? (q.sre, q.sim) : (are, aim)
+    @inbounds for j0 in 0:tl:M1-1
+        tt = min(tl, M1 - j0)
+        for i in 0:tt-1
+            blk = LM*(j0+i)+1:LM*(j0+i+1)
+            sl = LM*i+1:LM*(i+1)
+            run_chain!(view(are, blk), view(aim, blk), view(q.sre, sl), view(q.sim, sl),
+                       q.stA, M2, 1, L, d)
+        end
+        base = inscratch ? 0 : LM * j0   # block j0 + i's rows start at base + LM·i
+        for k2 in 0:M2-1, i in 0:tt-1
+            j1 = j0 + i
             wr = q.twr[j1+M1*k2+1]
             wi = q.twi[j1+M1*k2+1]
+            src = base + LM * i + L * k2
+            dst = L * (j1 + P1 * k2)
             for v in 1:W:L
-                yr = vload(Vec{W,T}, cre, L * k2 + v)
-                yi = vload(Vec{W,T}, cim, L * k2 + v)
-                vstore(muladd(yr, wr, -(yi * wi)), bre, L * (j1 + P1 * k2) + v)
-                vstore(muladd(yr, wi, yi * wr), bim, L * (j1 + P1 * k2) + v)
+                yr = vload(Vec{W,T}, sr, src + v)
+                yi = vload(Vec{W,T}, si, src + v)
+                vstore(muladd(yr, wr, -(yi * wi)), bre, dst + v)
+                vstore(muladd(yr, wi, yi * wr), bim, dst + v)
             end
         end
     end
@@ -354,24 +373,29 @@ function _fourstep_a!(p::FourStepPlan{T,D}, buf::FsScratch{T}, px::Ptr{T},
         # a ragged last strip (columns past N1) masks its loads, so it never
         # reads past x; its spare lanes land in z's row padding
         lim = N1 - c
-        # row j2 = a + M1·b goes to slot b + M2·a
-        for a in 0:M1-1, b in 0:M2-1, v in 0:W:S-1
-            e = c + N1 * (a + M1 * b) + v
-            if lim ≥ S
-                u = vload(Vec{W,T}, px + sz * 2e)
-                w = vload(Vec{W,T}, px + sz * (2e + W))
-            else
-                u = vload(Vec{W,T}, px + sz * 2e, _cmask(Val(W), v, lim))
-                w = vload(Vec{W,T}, px + sz * (2e + W), _cmask(Val(W), v + W ÷ 2, lim))
+        # row j2 = a + M1·b goes to slot b + M2·a; rows are read in order
+        # (a nested split's permuted order jumps M1 rows of x per row)
+        for j2 in 0:N2-1
+            b, a = divrem(j2, M1)
+            slot = b + M2 * a
+            for v in 0:W:S-1
+                e = c + N1 * j2 + v
+                if lim ≥ S
+                    u = vload(Vec{W,T}, px + sz * 2e)
+                    w = vload(Vec{W,T}, px + sz * (2e + W))
+                else
+                    u = vload(Vec{W,T}, px + sz * 2e, _cmask(Val(W), v, lim))
+                    w = vload(Vec{W,T}, px + sz * (2e + W), _cmask(Val(W), v + W ÷ 2, lim))
+                end
+                r, i = deinterleave2(u, w)
+                vstore(r, are, S * slot + v + 1)
+                vstore(i, aim, S * slot + v + 1)
             end
-            r, i = deinterleave2(u, w)
-            vstore(r, are, S * (b + M2 * a) + v + 1)
-            vstore(i, aim, S * (b + M2 * a) + v + 1)
         end
         cre, cim = _lanes_fft!(buf.innerA, p.stA, are, aim, buf.bre, buf.bim, N2, S, Val(D))
-        # output row k2 = b + M2·a sits at slot a + P1·b
-        for b in 0:M2-1, a in 0:M1-1
-            k2 = b + M2 * a
+        # output row k2 = b + M2·a sits at slot a + P1·b; z rows written in order
+        for k2 in 0:N2-1
+            a, b = divrem(k2, M2)
             slot = a + P1 * b
             if !TW
                 for v in 1:W:S
@@ -415,6 +439,10 @@ function _fourstep_b!(p::FourStepPlan{T,D}, buf::FsScratch{T}, py::Ptr{T},
     sc = Vec{W,T}(p.scale)
     M1, M2, P1 = _lanes_geom(p.innerB, N1)
     Z1 = p.Z1
+    # output rows are written a G-lane segment at a time, N2 apart, to an
+    # array far bigger than cache: non-temporal stores skip the read for
+    # ownership of every line (needs vector-aligned rows: y aligned, W | N2)
+    ntst = 2 * p.n * sz ≥ _FS_NT_MIN_BYTES && N2 % W == 0 && UInt(py) % (W * sz) == 0
     @inbounds for c2 in G*(glo-1):G:G*ghi-1
         # a ragged last group reads z's zero rows past N2 and masks its stores
         lim = N2 - c2
@@ -438,17 +466,22 @@ function _fourstep_b!(p::FourStepPlan{T,D}, buf::FsScratch{T}, py::Ptr{T},
             end
         end
         cre, cim = _lanes_fft!(buf.innerB, p.stB, are, aim, buf.bre, buf.bim, N1, G, Val(D))
-        # output row k1 = b + M2·a sits at slot a + P1·b
-        for b in 0:M2-1, a in 0:M1-1, v in 0:W:G-1
-            k1 = b + M2 * a
+        # output row k1 = b + M2·a sits at slot a + P1·b; y rows written in order
+        for k1 in 0:N1-1, v in 0:W:G-1
+            a, b = divrem(k1, M2)
             slot = a + P1 * b
             r = vload(Vec{W,T}, cre, G * slot + v + 1) * sc
             i = vload(Vec{W,T}, cim, G * slot + v + 1) * sc
             lo, hi = interleave_chunks(r, i, Val(1))
             e = c2 + N2 * k1 + v
             if lim ≥ G
-                vstore(lo, py + sz * 2e)
-                vstore(hi, py + sz * (2e + W))
+                if ntst
+                    vstorent(lo, py + sz * 2e)
+                    vstorent(hi, py + sz * (2e + W))
+                else
+                    vstore(lo, py + sz * 2e)
+                    vstore(hi, py + sz * (2e + W))
+                end
             else
                 # columns past N2 would be the next output row's
                 vstore(lo, py + sz * 2e, _cmask(Val(W), v, lim))
@@ -456,8 +489,13 @@ function _fourstep_b!(p::FourStepPlan{T,D}, buf::FsScratch{T}, py::Ptr{T},
             end
         end
     end
+    # non-temporal stores are weakly ordered: fence before y is read
+    ntst && Threads.atomic_fence()
     return nothing
 end
+
+# smallest output given non-temporal stores in pass B (beyond what caches hold)
+const _FS_NT_MIN_BYTES = 8 << 20
 
 # A 2-D n1×n2 transform (dim 1 contiguous) is a four-step without the
 # twiddle: pass A transforms strips of the strided dim 2 straight from the
