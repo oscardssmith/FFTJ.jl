@@ -75,6 +75,60 @@ function stage4!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::Plan
     return nothing
 end
 
+# Twiddled radix-8 stage (m = n/8 butterflies at stride s), as stage4!: DFT8
+# then outputs 1..7 times w^j (twr/twi hold 7 twiddles per butterfly). One
+# radix-8 stage does the work of 1.5 radix-4 stages in a single sweep.
+function stage8!(yre::PlaneVec{T}, yim::PlaneVec{T}, xre::PlaneVec{T}, xim::PlaneVec{T},
+                 n::Int, s::Int, twr::Vector{T}, twi::Vector{T}, d::Val{D},
+                 prange::UnitRange{Int}=0:(n >>> 3)-1,
+                 qrange::UnitRange{Int}=1:s) where {T,D}
+    m = n >>> 3
+    ms = m * s
+    W = pick_width(T)
+    if W > 1 && length(qrange) ≥ W
+        c = Vec{W,T}(T(sqrt(0.5)))
+        @inbounds for p in prange
+            Base.Cartesian.@nexprs 7 j -> begin
+                wr_j = Vec{W,T}(twr[7p+j]); wi_j = Vec{W,T}(twi[7p+j])
+            end
+            xb = s * p
+            yb = 8 * s * p
+            for q in QWin(qrange, W)
+                Base.Cartesian.@nexprs 8 k -> begin
+                    xr_k = vload(Vec{W,T}, xre, xb + (k - 1) * ms + q)
+                    xi_k = vload(Vec{W,T}, xim, xb + (k - 1) * ms + q)
+                end
+                ys = bf8_core(xr_1, xi_1, xr_2, xi_2, xr_3, xi_3, xr_4, xi_4,
+                              xr_5, xi_5, xr_6, xi_6, xr_7, xi_7, xr_8, xi_8, c, d)
+                vstore(ys[1], yre, yb + q); vstore(ys[2], yim, yb + q)
+                Base.Cartesian.@nexprs 7 j -> begin
+                    yr_j, yi_j = cmul(wr_j, wi_j, ys[2j+1], ys[2j+2])
+                    vstore(yr_j, yre, yb + j * s + q); vstore(yi_j, yim, yb + j * s + q)
+                end
+            end
+        end
+    else
+        c = T(sqrt(0.5))
+        @inbounds for p in prange
+            xb = s * p
+            yb = 8 * s * p
+            for q in qrange
+                Base.Cartesian.@nexprs 8 k -> begin
+                    xr_k = xre[xb+(k-1)*ms+q]; xi_k = xim[xb+(k-1)*ms+q]
+                end
+                ys = bf8_core(xr_1, xi_1, xr_2, xi_2, xr_3, xi_3, xr_4, xi_4,
+                              xr_5, xi_5, xr_6, xi_6, xr_7, xi_7, xr_8, xi_8, c, d)
+                yre[yb+q] = ys[1]; yim[yb+q] = ys[2]
+                Base.Cartesian.@nexprs 7 j -> begin
+                    yr_j, yi_j = cmul(twr[7p+j], twi[7p+j], ys[2j+1], ys[2j+2])
+                    yre[yb+j*s+q] = yr_j; yim[yb+j*s+q] = yi_j
+                end
+            end
+        end
+    end
+    return nothing
+end
+
 # Small-stride radix-4 stage (s < W): vectorize across W÷s butterfly groups by
 # loading W consecutive flat elements from each quarter; the strided output
 # permutation becomes a static register interleave. Twiddles are pre-expanded

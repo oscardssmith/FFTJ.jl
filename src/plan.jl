@@ -96,6 +96,47 @@ end
 
 default_scale(::Type{T}, n, D) where {T} = D == -1 ? one(T) : one(T) / n
 
+# twiddled radix-8 stages in the power-of-two tower (a const so A/B runs can
+# redefine it and rebuild)
+const _RADIX8_TOWER = true
+
+# (final radix f, tower radices) for a power-of-two part 2^a. The tower opens
+# with radix 4 (fused-input and small-stride layouts are radix-4 only) and
+# stays radix 4 while a 1-D stride is below W; the rest takes radix 8 where it
+# can, with f chosen jointly so the chain is shortest: fewer stages, fewer
+# sweeps over the data. Without radix-8 towers: all radix 4, f = 2/4/8.
+function _tower(::Type{T}, a::Int, allow_small::Bool) where {T}
+    a == 0 && return 1, Int[]
+    f0 = isodd(a) ? (a ≥ 3 ? 8 : 2) : 4
+    best = (f0, fill(4, (a - trailing_zeros(f0)) ÷ 2))
+    _RADIX8_TOWER || return best
+    W = pick_width(T)
+    # radix 8 only when it saves a stage: at equal length the radix-4 tower
+    # with its twiddle-free final stage measured faster (512²: 1.06-1.17×)
+    for f in (8, 4, 2)
+        r = a - trailing_zeros(f)
+        r < 0 && continue
+        if r == 0
+            tower = Int[]
+        else
+            k = 1   # radix-4 prefix
+            while allow_small && 4^k < W && 2(k + 1) ≤ r
+                k += 1
+            end
+            rr = r - 2k
+            rr < 0 && continue
+            n8 = rr ÷ 3
+            while n8 ≥ 0 && isodd(rr - 3n8)
+                n8 -= 1
+            end
+            n8 < 0 && continue
+            tower = [fill(4, k); fill(8, n8); fill(4, (rr - 3n8) ÷ 2)]
+        end
+        length(tower) < length(best[2]) && (best = (f, tower))
+    end
+    return best
+end
+
 # The 1-D stage chain for an n factoring over ODD_RADICES: final power-of-two
 # stage f (m == 1, twiddle-free, fusable); the rest of the 2-part runs as a
 # radix-4 tower first, so the odd-radix stages in between see large
@@ -107,15 +148,14 @@ function build_stages(::Type{T}, n::Int, D::Int; allow_small::Bool=true) where {
     fac === nothing &&
         throw(ArgumentError("build_stages requires a length with prime factors ≤ $(ODD_RADICES[1]) (got $n)"))
     a, ps = fac
-    f = a == 0 ? 1 : isodd(a) ? (a ≥ 3 ? 8 : 2) : 4
-    k4 = (a - trailing_zeros(f)) ÷ 2
+    f, tower = _tower(T, a, allow_small)
     stages = Stage{T}[]
     ncur = n
     s = 1
-    for _ in 1:k4
-        push!(stages, make_stage(T, 4, ncur, s, D; allow_small))
-        s *= 4
-        ncur >>>= 2
+    for r in tower
+        push!(stages, make_stage(T, r, ncur, s, D; allow_small))
+        s *= r
+        ncur ÷= r
     end
     # odd stages run smallest radix first: when the 2-part is small the first
     # odd stage inherits a stride < W (scalar path), and a scalar radix-3
@@ -208,7 +248,9 @@ plan_bfft(::Type{T}, n::Integer; nthreads::Integer=Threads.nthreads()) where {T<
             stage4!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d)
         end
     elseif st.radix == 8
-        stage8_plain!(bre, bim, are, aim, s, d)
+        # m == 1: the twiddle-free final stage
+        ncur == 8 ? stage8_plain!(bre, bim, are, aim, s, d) :
+                    stage8!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d)
     elseif st.radix == 3
         stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(3), d)
     elseif st.radix == 5
@@ -244,7 +286,7 @@ function run_stage_par!(bre, bim, are, aim, ncur::Int, s::Int, st, d::Val, nt::I
                                                st.twr, st.twi, d, lo:hi),
                      (ncur >>> 2) * 4, nt; align=W)
         end
-    elseif radix == 8
+    elseif radix == 8 && ncur == 8
         tforeach((lo, hi) -> stage8_plain!(bre, bim, are, aim, s, d, lo:hi),
                  s, nt; align=W)
     else
@@ -267,6 +309,8 @@ end
     radix = st.radix
     if radix == 4
         stage4!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d, pr, qr)
+    elseif radix == 8
+        stage8!(bre, bim, are, aim, ncur, s, st.twr, st.twi, d, pr, qr)
     elseif radix == 3
         stagep!(bre, bim, are, aim, ncur, s, st.twr, st.twi, Val(3), d, pr, qr)
     elseif radix == 5
